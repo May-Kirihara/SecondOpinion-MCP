@@ -170,6 +170,23 @@ path via env:
 }
 ```
 
+#### Finding the `opencode` binary
+
+MCP hosts (Claude Desktop, Claude Code, etc.) usually launch subprocesses with
+a minimal PATH — often just `/usr/bin:/bin`. The MCP server falls back to
+searching common opencode install locations (`~/.opencode/bin`, `~/.bun/bin`,
+`~/.local/bin`, `/opt/opencode/bin`, `/usr/local/bin`), so most installs work
+out of the box. If yours is elsewhere, either:
+
+- Set an absolute path in your TOML: `opencode_binary = "/abs/path/to/opencode"`
+- Or extend PATH in the mcp.json `env`:
+
+  ```json
+  "env": {
+    "PATH": "/home/me/.opencode/bin:/usr/bin:/bin"
+  }
+  ```
+
 Then from inside Claude Code:
 
 > Use `secondopinion` to get a second opinion on the diff from another model.

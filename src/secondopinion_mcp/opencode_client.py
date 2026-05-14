@@ -35,6 +35,49 @@ def _pick_free_port() -> int:
         return s.getsockname()[1]
 
 
+# Common install locations to fall back on when PATH doesn't include opencode.
+# MCP hosts often launch subprocesses with a minimal PATH (e.g. /usr/bin:/bin),
+# but opencode typically lives in a per-user directory.
+_OPENCODE_FALLBACK_DIRS = (
+    "~/.opencode/bin",
+    "~/.bun/bin",
+    "~/.local/bin",
+    "/opt/opencode/bin",
+    "/usr/local/bin",
+)
+
+
+def _resolve_opencode_binary(name: str) -> str:
+    """Return an absolute path to the opencode binary, or raise a clear error."""
+    p = Path(name).expanduser()
+    if p.is_absolute():
+        if p.is_file() and os.access(p, os.X_OK):
+            return str(p)
+        raise FileNotFoundError(
+            f"opencode_binary={name!r} does not point to an executable file."
+        )
+
+    # Bare name: try PATH first.
+    found = shutil.which(name)
+    if found:
+        return found
+
+    # Then walk well-known install locations.
+    for d in _OPENCODE_FALLBACK_DIRS:
+        candidate = Path(d).expanduser() / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+
+    searched = ":".join(os.environ.get("PATH", "").split(os.pathsep)) or "(empty)"
+    fallbacks = ", ".join(_OPENCODE_FALLBACK_DIRS)
+    raise FileNotFoundError(
+        f"Could not find {name!r} on PATH or in known install locations. "
+        f"PATH={searched!r}. Also tried: {fallbacks}. "
+        f"Fix by either (a) setting opencode_binary to an absolute path in your "
+        f"secondopinion.toml, or (b) extending PATH via the mcp.json `env` block."
+    )
+
+
 _LISTEN_RE = re.compile(r"http://([^\s:]+):(\d+)")
 
 
@@ -65,7 +108,7 @@ class OpencodeClient:
         async with self._startup_lock:
             if self._proc is not None:
                 return
-            binary = shutil.which(self.config.opencode_binary) or self.config.opencode_binary
+            binary = _resolve_opencode_binary(self.config.opencode_binary)
             port = self.config.server.port or _pick_free_port()
             hostname = self.config.server.hostname
             args = [
