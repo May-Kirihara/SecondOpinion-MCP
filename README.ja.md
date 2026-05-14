@@ -108,6 +108,8 @@ second_opinion(
 
 ## Claude Code への登録
 
+CLI 経由:
+
 ```bash
 claude mcp add secondopinion -- /path/to/SecondOpinion-MCP/.venv/bin/secondopinion-mcp
 ```
@@ -116,6 +118,38 @@ claude mcp add secondopinion -- /path/to/SecondOpinion-MCP/.venv/bin/secondopini
 
 ```bash
 claude mcp add secondopinion -- uv run --project /path/to/SecondOpinion-MCP secondopinion-mcp
+```
+
+### `mcp.json` に直接書く場合
+
+MCP 設定ファイル (`~/.claude.json` / `.mcp.json` / 他エージェントの `mcp.json` 等) を手で編集する場合は次のように書きます:
+
+```json
+{
+  "mcpServers": {
+    "secondopinion": {
+      "command": "/path/to/SecondOpinion-MCP/.venv/bin/python",
+      "args": ["-m", "secondopinion_mcp"],
+      "cwd": "/path/to/SecondOpinion-MCP"
+    }
+  }
+}
+```
+
+`cwd` をプロジェクトルートに指定しておくと、そこにある `./secondopinion.toml` が自動的に拾われます。別の場所の設定ファイルを使いたい場合は `cwd` を外して `env` でパスを渡します:
+
+```json
+{
+  "mcpServers": {
+    "secondopinion": {
+      "command": "/path/to/SecondOpinion-MCP/.venv/bin/python",
+      "args": ["-m", "secondopinion_mcp"],
+      "env": {
+        "SECONDOPINION_MCP_CONFIG": "/home/me/.config/secondopinion-mcp/config.toml"
+      }
+    }
+  }
+}
 ```
 
 登録後、Claude Code 内で例えば次のように指示します:

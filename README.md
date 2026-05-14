@@ -123,14 +123,51 @@ of the config — handy when you want all calls routed offline.
 
 ## Register with Claude Code
 
+Via the CLI:
+
 ```bash
 claude mcp add secondopinion -- /path/to/SecondOpinion-MCP/.venv/bin/secondopinion-mcp
 ```
 
-Or, with `uv`:
+Or with `uv`:
 
 ```bash
 claude mcp add secondopinion -- uv run --project /path/to/SecondOpinion-MCP secondopinion-mcp
+```
+
+### Or write it directly into `mcp.json`
+
+If you're hand-editing a tool's MCP config file (`~/.claude.json` /
+`.mcp.json` / `mcp.json` for other agents), add an entry like:
+
+```json
+{
+  "mcpServers": {
+    "secondopinion": {
+      "command": "/path/to/SecondOpinion-MCP/.venv/bin/python",
+      "args": ["-m", "secondopinion_mcp"],
+      "cwd": "/path/to/SecondOpinion-MCP"
+    }
+  }
+}
+```
+
+`cwd` matters: with it set to the project root, `./secondopinion.toml` will be
+auto-discovered. To point at a config file elsewhere, drop `cwd` and pass the
+path via env:
+
+```json
+{
+  "mcpServers": {
+    "secondopinion": {
+      "command": "/path/to/SecondOpinion-MCP/.venv/bin/python",
+      "args": ["-m", "secondopinion_mcp"],
+      "env": {
+        "SECONDOPINION_MCP_CONFIG": "/home/me/.config/secondopinion-mcp/config.toml"
+      }
+    }
+  }
+}
 ```
 
 Then from inside Claude Code:
