@@ -1,0 +1,68 @@
+# SecondOpinion-MCP — example configuration
+#
+# Place this file at one of:
+#   - $SECONDOPINION_MCP_CONFIG                       (highest priority)
+#   - ./secondopinion.toml                            (current working dir)
+#   - ~/.config/secondopinion-mcp/config.toml         (XDG)
+#
+# Provider IDs and model IDs must match what your opencode installation
+# already knows about. Check with:  opencode models
+
+# Path to the opencode binary. Leave as "opencode" if it's on PATH.
+opencode_binary = "opencode"
+
+# Default opencode agent ("build", "plan", or any custom agent you've defined).
+default_agent = "build"
+
+# Default provider key — must match one of the [providers.*] table names below.
+default_provider = "glm"
+
+# Optional: working directory passed to `opencode serve`. Defaults to the
+# directory the MCP server itself was launched from.
+# working_dir = "/path/to/some/project"
+
+# Optional: extra args appended to the `opencode serve` invocation.
+# extra_serve_args = ["--log-level", "INFO"]
+
+[server]
+port = 0                  # 0 = pick a random free port
+hostname = "127.0.0.1"
+startup_timeout_s = 30
+request_timeout_s = 600   # generous — second opinions can take a while
+
+# ----- Providers ------------------------------------------------------------
+# Each [providers.<key>] table maps a friendly name to an opencode
+# provider/model pair.
+
+[providers.glm]
+provider_id = "zai-coding-plan"
+model_id = "glm-5.1"
+description = "Z.AI GLM-5.1 (coding plan)"
+
+# Example: a locally hosted llama.cpp model registered in your opencode.json
+# [providers.qwen-local]
+# provider_id = "llama.cpp"
+# model_id = "qwen3.5-REAP-262B"
+# description = "Local Qwen 3.5 REAP 262B via llama.cpp"
+
+# Example: a reasoning-effort variant
+# [providers.glm-high]
+# provider_id = "zai-coding-plan"
+# model_id = "glm-5.1"
+# variant = "high"
+# description = "GLM-5.1 with high reasoning effort"
+
+# ----- Per-tool overrides (optional) ----------------------------------------
+
+[tools.second_opinion]
+# agent = "plan"   # use a read-only agent for second opinions if you've defined one
+# system_prompt = """
+# You are a senior reviewer. Be blunt about flaws, name concrete improvements,
+# and skip pleasantries.
+# """
+
+[tools.delegate_task]
+# agent = "build"
+# system_prompt = """
+# You are a subagent. Complete the task carefully and report back with results.
+# """

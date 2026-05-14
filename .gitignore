@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# SecondOpinion-MCP local config (use config.example.toml as a template)
+secondopinion.toml
+.secondopinion.toml
+
+# uv / venv
+.venv/
+uv.lock
