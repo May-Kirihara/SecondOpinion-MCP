@@ -49,6 +49,63 @@ model_id = "glm-5.1"
 
 `provider_id` と `model_id` は `opencode models` の出力と一致している必要があります (= `~/.config/opencode/opencode.json` の内容)。
 
+### 例: ローカルの llama.cpp モデルを使う
+
+まず opencode 側 (`~/.config/opencode/opencode.json`) に llama.cpp のエンドポイントを登録します。opencode 標準同梱の [`@ai-sdk/openai-compatible`](https://www.npmjs.com/package/@ai-sdk/openai-compatible) アダプタを使うのが手軽です:
+
+```json
+{
+  "provider": {
+    "llama.cpp": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "llama.cpp (local)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8080/v1"
+      },
+      "models": {
+        "qwen3-coder-30b": {
+          "name": "Qwen3-Coder-30B-A3B-Instruct.gguf",
+          "tools": true
+        }
+      }
+    }
+  }
+}
+```
+
+opencode 側で認識されているか確認:
+
+```bash
+opencode models llama.cpp
+```
+
+そのうえで `secondopinion.toml` に追記します。`model_id` は `models` の**キー名** (ここでは `qwen3-coder-30b`) であり、**GGUF のファイル名ではない**点に注意:
+
+```toml
+default_provider = "glm"
+
+[providers.glm]
+provider_id = "zai-coding-plan"
+model_id = "glm-5.1"
+
+[providers.qwen-local]
+provider_id = "llama.cpp"
+model_id    = "qwen3-coder-30b"
+description = "ローカル Qwen3 Coder 30B (llama.cpp 経由)"
+```
+
+Claude Code 側からは `provider` 引数で指定して呼び出せます:
+
+```
+second_opinion(
+  question="並行処理周りでバグありそう?",
+  files=["src/handler.rs"],
+  provider="qwen-local"
+)
+```
+
+あるいは設定先頭で `default_provider = "qwen-local"` に切り替えてしまえば、全呼び出しをオフラインに回せて便利です。
+
 ## Claude Code への登録
 
 ```bash

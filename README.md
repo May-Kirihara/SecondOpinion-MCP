@@ -59,6 +59,68 @@ model_id = "glm-5.1"
 Provider/model IDs must match what `opencode models` reports — i.e. whatever's
 in your own `~/.config/opencode/opencode.json`.
 
+### Example: a local llama.cpp model
+
+First, register the llama.cpp endpoint in your opencode config
+(`~/.config/opencode/opencode.json`). This uses the
+[`@ai-sdk/openai-compatible`](https://www.npmjs.com/package/@ai-sdk/openai-compatible)
+adapter that opencode ships with:
+
+```json
+{
+  "provider": {
+    "llama.cpp": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "llama.cpp (local)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8080/v1"
+      },
+      "models": {
+        "qwen3-coder-30b": {
+          "name": "Qwen3-Coder-30B-A3B-Instruct.gguf",
+          "tools": true
+        }
+      }
+    }
+  }
+}
+```
+
+Verify opencode sees the model:
+
+```bash
+opencode models llama.cpp
+```
+
+Then add it to your `secondopinion.toml`. The `model_id` is the **key** under
+`models` (here `qwen3-coder-30b`), **not** the GGUF filename:
+
+```toml
+default_provider = "glm"
+
+[providers.glm]
+provider_id = "zai-coding-plan"
+model_id = "glm-5.1"
+
+[providers.qwen-local]
+provider_id = "llama.cpp"
+model_id    = "qwen3-coder-30b"
+description = "Local Qwen3 Coder 30B via llama.cpp"
+```
+
+Use it from Claude Code by passing the `provider` argument:
+
+```
+second_opinion(
+  question="Spot any concurrency bugs?",
+  files=["src/handler.rs"],
+  provider="qwen-local"
+)
+```
+
+Or make it the default by setting `default_provider = "qwen-local"` at the top
+of the config — handy when you want all calls routed offline.
+
 ## Register with Claude Code
 
 ```bash
