@@ -3,21 +3,67 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
 import shutil
 import socket
+import time
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
 from .config import Config, Provider
 
 log = logging.getLogger(__name__)
+
+
+class TransportStall(httpx.TransportError):
+    """An in-flight opencode request produced zero *liveness* (no `/event` SSE
+    scoped to its session) for `stall_idle_timeout_s` seconds.
+
+    Subclasses `httpx.TransportError` so callers that already handle httpx
+    transport errors treat a stall like any other transport failure — only it
+    surfaces in ~idle-timeout seconds (≈30s) instead of after the full
+    `request_timeout_s` (600s) wall-clock spent silently blocked.
+    """
+
+
+def _find_session_id(obj: object) -> str | None:
+    """Recursively locate a session-id-ish string in an SSE event payload.
+
+    opencode keys it as `sessionID` / `session_id` / `session` at varying
+    depths across event types, so we search rather than assume a fixed path.
+    """
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k.lower() in ("sessionid", "session_id", "session") and isinstance(v, str):
+                return v
+            found = _find_session_id(v)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for it in obj:
+            found = _find_session_id(it)
+            if found:
+                return found
+    return None
+
+
+def _event_is_live(ev: dict, sid: str) -> bool:
+    """True ONLY if this SSE event proves *our* request is still progressing,
+    i.e. it is scoped to our session `sid` (e.g. `message.part.delta`).
+
+    Deliberately does NOT count `server.heartbeat`: opencode emits that on the
+    global `/event` stream every ~10s independently of any request, so a
+    zero-token transport stall still sees heartbeats. Counting them as liveness
+    would reset the idle clock forever and the watchdog would never fire.
+    """
+    return _find_session_id(ev) == sid
 
 
 @dataclass
@@ -257,10 +303,101 @@ class OpencodeClient:
         if system_prompt:
             body["system"] = system_prompt
 
-        r = await self.http.post(f"/session/{session_id}/message", json=body)
+        path = f"/session/{session_id}/message"
+        idle = self.config.server.stall_idle_timeout_s
+        if idle and idle > 0:
+            r = await self._post_with_stall_watchdog(path, body, session_id, idle)
+        else:
+            # Legacy path: byte-identical to pre-watchdog behaviour
+            # (stall_idle_timeout_s <= 0 fully disables the watchdog).
+            r = await self.http.post(path, json=body)
         r.raise_for_status()
         data = r.json()
         return _parse_message_response(session_id, data)
+
+    async def _liveness_from_events(
+        self,
+        session_id: str,
+        beat: Callable[[], None],
+        attached: asyncio.Event,
+        stop: asyncio.Event,
+    ) -> None:
+        """Consume the `/event` SSE stream and call `beat()` on every event
+        that proves *this* request is still progressing. Best-effort: if the
+        stream cannot be established the monitor just exits (`attached` stays
+        clear) and the caller falls back to the plain POST timeout —
+        availability is never sacrificed for the watchdog.
+        """
+        try:
+            async with self.http.stream(
+                "GET", "/event", timeout=httpx.Timeout(10.0, read=None)
+            ) as r:
+                if r.status_code != 200:
+                    return
+                attached.set()
+                beat()  # SSE established == liveness; start the idle clock.
+                async for line in r.aiter_lines():
+                    if stop.is_set():
+                        return
+                    if not line or not line.startswith("data:"):
+                        continue
+                    try:
+                        ev = json.loads(line[5:].strip())
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(ev, dict) and _event_is_live(ev, session_id):
+                        beat()
+        except (httpx.HTTPError, httpx.StreamError, asyncio.TimeoutError):
+            return
+
+    async def _post_with_stall_watchdog(
+        self,
+        path: str,
+        body: dict[str, Any],
+        session_id: str,
+        idle: float,
+    ) -> httpx.Response:
+        """Race the message POST against an SSE-liveness watchdog. If no
+        session-scoped liveness arrives for `idle` seconds the POST is
+        cancelled and `TransportStall` is raised. The POST keeps its own
+        `request_timeout_s` as the absolute backstop for the slow-but-alive
+        case — we never lower the wall-clock (that would false-kill healthy
+        long turns, which keep emitting session events and so never trip the
+        idle clock).
+        """
+        last = [time.monotonic()]
+        attached = asyncio.Event()
+        stop = asyncio.Event()
+
+        def beat() -> None:
+            last[0] = time.monotonic()
+
+        sse = asyncio.create_task(
+            self._liveness_from_events(session_id, beat, attached, stop)
+        )
+        post = asyncio.create_task(self.http.post(path, json=body))
+        try:
+            while True:
+                done, _ = await asyncio.wait({post}, timeout=min(idle, 5.0))
+                if post in done:
+                    return post.result()
+                # SSE never attached → watchdog disabled, fall back to the
+                # POST's own httpx wall-clock timeout (legacy safety).
+                if sse.done() and not attached.is_set():
+                    return await post
+                if attached.is_set() and time.monotonic() - last[0] > idle:
+                    post.cancel()
+                    with suppress(asyncio.CancelledError, Exception):
+                        await post
+                    raise TransportStall(
+                        f"no opencode liveness for {idle:.0f}s "
+                        f"(session {session_id}); connection stalled"
+                    )
+        finally:
+            stop.set()
+            sse.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await sse
 
 
 def _file_part(path: Path) -> dict[str, Any]:

@@ -197,6 +197,9 @@ end_session(session_id=result.session_id)
 - `default_agent` — opencode のエージェント名 (`build`, `plan`, または独自に定義したもの)。
 - `extra_serve_args` — `opencode serve` に渡す追加 CLI 引数。
 - `[server]` — port (`0` でランダム)、hostname、各種タイムアウト。
+  `stall_idle_timeout_s` は SSE 生存 watchdog の閾値: opencode の動きが
+  この秒数途絶えたリクエストを、`request_timeout_s` を丸ごと待たずに
+  transport stall として即座に失敗させる (`0` で無効)。
 - `[tools.<tool_name>]` — ツール単位の `agent` と `system_prompt` 上書き。
 
 ## 環境変数

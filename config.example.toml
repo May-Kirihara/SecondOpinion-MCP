@@ -30,6 +30,15 @@ hostname = "127.0.0.1"
 startup_timeout_s = 30
 request_timeout_s = 600   # generous — second opinions can take a while
 
+# SSE-liveness watchdog. While a request is in flight the client subscribes to
+# opencode's `/event` stream; if no event scoped to that session arrives for
+# this many seconds, the request is failed fast as a transport stall instead of
+# blocking the full `request_timeout_s` in silence. `request_timeout_s` stays as
+# the backstop for slow-but-alive turns (they keep emitting events). Healthy
+# turns show a first event in ~1s and gaps under ~5s, so 30 leaves a wide
+# margin. Set to 0 to disable the watchdog (legacy behaviour).
+stall_idle_timeout_s = 30
+
 # ----- Providers ------------------------------------------------------------
 # Each [providers.<key>] table maps a friendly name to an opencode
 # provider/model pair.

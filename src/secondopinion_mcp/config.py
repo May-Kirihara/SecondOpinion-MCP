@@ -43,6 +43,11 @@ class ServerOpts:
     hostname: str = "127.0.0.1"
     startup_timeout_s: float = 30.0
     request_timeout_s: float = 600.0
+    # SSE-liveness watchdog: if an in-flight message POST sees no session-scoped
+    # `/event` for this many seconds it is failed fast as a transport stall,
+    # instead of blocking the full `request_timeout_s` in silence. 0 disables
+    # the watchdog (legacy behaviour). See OpencodeClient._post_with_stall_watchdog.
+    stall_idle_timeout_s: float = 30.0
 
 
 @dataclass
@@ -119,6 +124,7 @@ def load_config(path: Path | None = None) -> Config:
             hostname=str(s.get("hostname", "127.0.0.1")),
             startup_timeout_s=float(s.get("startup_timeout_s", 30.0)),
             request_timeout_s=float(s.get("request_timeout_s", 600.0)),
+            stall_idle_timeout_s=float(s.get("stall_idle_timeout_s", 30.0)),
         )
 
     providers_raw = raw.get("providers") or {}

@@ -218,7 +218,10 @@ See `config.example.toml`. Notable knobs:
 
 - `default_agent` — opencode agent name (`build`, `plan`, or your own).
 - `extra_serve_args` — extra CLI args passed to `opencode serve`.
-- `[server]` — port (0 = random), hostname, timeouts.
+- `[server]` — port (0 = random), hostname, timeouts. `stall_idle_timeout_s`
+  controls the SSE-liveness watchdog: a request with no opencode activity for
+  that many seconds is failed fast as a transport stall instead of blocking the
+  full `request_timeout_s` (set 0 to disable).
 - `[tools.<tool_name>]` — per-tool overrides for `agent` and `system_prompt`.
 
 ## Environment variables
