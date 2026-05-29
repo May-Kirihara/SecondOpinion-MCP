@@ -21,11 +21,30 @@ opencode subprocess is shut down cleanly when the MCP server exits.
 |---|---|
 | `second_opinion` | One-shot review/critique. Session is created and discarded. |
 | `delegate_task` | Multi-turn subagent. Returns a `session_id` to continue. |
+| `poll_task` | Resume waiting for a `running` job (see below). |
 | `end_session` | Explicitly free a `delegate_task` session. |
 | `list_providers` | Show providers from the TOML config. |
 
 All tools accept an optional `provider` argument that picks which entry from
 `[providers.*]` to use; omit it to use `default_provider`.
+
+### Asynchronous replies (why you won't time out)
+
+External reasoning models are slow — a single reply can take from ~30 seconds
+to several minutes. To avoid tripping the **calling** MCP host's per-tool
+timeout (often ~60s), `second_opinion` and `delegate_task` are asynchronous:
+
+1. They start the work and wait only a short window (`server.wait_window_s`,
+   default 20s, or the per-call `max_wait_s` argument).
+2. If the reply finishes in that window you get `{"status": "done", "text": …}`
+   straight away.
+3. Otherwise you get `{"status": "running", "job_id": …}`. The model keeps
+   running server-side; call `poll_task(job_id=…)` to keep waiting and repeat
+   until `status` is `"done"`. **A `running` result is normal — do not abort or
+   retry the original request.**
+
+The server advertises this protocol in its MCP `instructions` and each tool's
+description, so a well-behaved calling agent polls instead of giving up.
 
 ## Install
 
@@ -206,10 +225,12 @@ second_opinion(
 Multi-turn subagent:
 
 ```
-result = delegate_task(task="Plan a refactor of the auth layer", files=["src/auth/"])
-# result.session_id = "ses_..."
-delegate_task(task="Now estimate effort in hours per step", session_id=result.session_id)
-end_session(session_id=result.session_id)
+r = delegate_task(task="Plan a refactor of the auth layer", files=["src/auth/"])
+# If r["status"] == "running", poll until done:
+#   r = poll_task(job_id=r["job_id"])   # repeat until r["status"] == "done"
+# Then r["session_id"] = "ses_..." and r["text"] holds the reply.
+delegate_task(task="Now estimate effort in hours per step", session_id=r["session_id"])
+end_session(session_id=r["session_id"])
 ```
 
 ## Configuration reference
@@ -221,7 +242,9 @@ See `config.example.toml`. Notable knobs:
 - `[server]` — port (0 = random), hostname, timeouts. `stall_idle_timeout_s`
   controls the SSE-liveness watchdog: a request with no opencode activity for
   that many seconds is failed fast as a transport stall instead of blocking the
-  full `request_timeout_s` (set 0 to disable).
+  full `request_timeout_s` (set 0 to disable). `wait_window_s` (default 20) is
+  how long the async tools block before returning a pollable `running` handle —
+  keep it under the calling host's per-tool timeout.
 - `[tools.<tool_name>]` — per-tool overrides for `agent` and `system_prompt`.
 
 ## Environment variables

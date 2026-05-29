@@ -39,6 +39,14 @@ request_timeout_s = 600   # generous — second opinions can take a while
 # margin. Set to 0 to disable the watchdog (legacy behaviour).
 stall_idle_timeout_s = 30
 
+# Hybrid async wait window. `second_opinion` / `delegate_task` / `poll_task`
+# block at most this many seconds for a reply; if the external model is still
+# thinking they return `status:"running"` with a `job_id` the caller polls via
+# `poll_task` (the model keeps running server-side). Keep this well under the
+# calling MCP host's per-tool timeout (often ~60s) so the call returns before
+# the host kills it. Override per-call with the tools' `max_wait_s` argument.
+wait_window_s = 20
+
 # ----- Providers ------------------------------------------------------------
 # Each [providers.<key>] table maps a friendly name to an opencode
 # provider/model pair.

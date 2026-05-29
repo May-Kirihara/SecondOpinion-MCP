@@ -48,6 +48,12 @@ class ServerOpts:
     # instead of blocking the full `request_timeout_s` in silence. 0 disables
     # the watchdog (legacy behaviour). See OpencodeClient._post_with_stall_watchdog.
     stall_idle_timeout_s: float = 30.0
+    # Hybrid async tools: how long second_opinion / delegate_task / poll_task
+    # block waiting for a reply before returning a `status:"running"` handle the
+    # caller can poll. Kept well under a typical MCP host tool-timeout (~60s) so
+    # the call returns before the host kills it. The external model keeps running
+    # server-side; poll_task resumes the wait. See server.py.
+    wait_window_s: float = 20.0
 
 
 @dataclass
@@ -125,6 +131,7 @@ def load_config(path: Path | None = None) -> Config:
             startup_timeout_s=float(s.get("startup_timeout_s", 30.0)),
             request_timeout_s=float(s.get("request_timeout_s", 600.0)),
             stall_idle_timeout_s=float(s.get("stall_idle_timeout_s", 30.0)),
+            wait_window_s=float(s.get("wait_window_s", 20.0)),
         )
 
     providers_raw = raw.get("providers") or {}

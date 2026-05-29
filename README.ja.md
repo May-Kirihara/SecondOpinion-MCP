@@ -14,10 +14,21 @@ MCP サーバーは起動時にローカルのランダムポートで `opencode
 |---|---|
 | `second_opinion` | ワンショットのレビュー/批評。セッションは都度作成し、返答後に破棄。 |
 | `delegate_task` | マルチターンのサブエージェント。継続用の `session_id` を返却。 |
+| `poll_task` | `running` ジョブの待機を再開する（下記参照）。 |
 | `end_session` | `delegate_task` のセッションを明示的に解放。 |
 | `list_providers` | TOML 設定上のプロバイダ一覧を表示。 |
 
 すべてのツールはオプションの `provider` 引数を受け取り、`[providers.*]` 内のどのエントリを使うか指定できます。省略時は `default_provider` が使われます。
+
+### 非同期な返答（タイムアウトで諦めないために）
+
+外部の推論モデルは遅く、1 回の返答に 30 秒〜数分かかることがあります。**呼び出し側** の MCP ホストが持つツール単位のタイムアウト（多くは 60 秒前後）に先に殺されないよう、`second_opinion` と `delegate_task` は非同期です。
+
+1. 処理を開始し、短い待ち窓（`server.wait_window_s`、既定 20 秒。呼び出しごとの `max_wait_s` 引数でも上書き可）だけ待ちます。
+2. その窓内に返答が完了すれば、そのまま `{"status": "done", "text": …}` が返ります。
+3. 間に合わなければ `{"status": "running", "job_id": …}` が返ります。モデルはサーバー側で動き続けているので、`poll_task(job_id=…)` を `status` が `"done"` になるまで繰り返し呼びます。**`running` は正常な状態です。元のリクエストを中断・再送しないでください。**
+
+このプロトコルは MCP の `instructions` と各ツールの説明文に明記してあるため、行儀のよい呼び出し側エージェントは諦めずに poll します。
 
 ## インストール
 
@@ -184,10 +195,12 @@ second_opinion(
 マルチターンのサブエージェント:
 
 ```
-result = delegate_task(task="認可レイヤのリファクタを計画して", files=["src/auth/"])
-# result.session_id = "ses_..."
-delegate_task(task="次にステップごとの工数を時間単位で見積もって", session_id=result.session_id)
-end_session(session_id=result.session_id)
+r = delegate_task(task="認可レイヤのリファクタを計画して", files=["src/auth/"])
+# r["status"] == "running" なら done になるまで poll:
+#   r = poll_task(job_id=r["job_id"])   # r["status"] == "done" になるまで繰り返す
+# done になると r["session_id"] = "ses_..."、r["text"] に返答が入る。
+delegate_task(task="次にステップごとの工数を時間単位で見積もって", session_id=r["session_id"])
+end_session(session_id=r["session_id"])
 ```
 
 ## 設定リファレンス
@@ -199,7 +212,9 @@ end_session(session_id=result.session_id)
 - `[server]` — port (`0` でランダム)、hostname、各種タイムアウト。
   `stall_idle_timeout_s` は SSE 生存 watchdog の閾値: opencode の動きが
   この秒数途絶えたリクエストを、`request_timeout_s` を丸ごと待たずに
-  transport stall として即座に失敗させる (`0` で無効)。
+  transport stall として即座に失敗させる (`0` で無効)。`wait_window_s`
+  (既定 20) は非同期ツールが `running` ハンドルを返すまでにブロックする秒数。
+  呼び出し側ホストのツールタイムアウトより短く保つこと。
 - `[tools.<tool_name>]` — ツール単位の `agent` と `system_prompt` 上書き。
 
 ## 環境変数
