@@ -210,6 +210,43 @@ Then from inside Claude Code:
 
 > Use `secondopinion` to get a second opinion on the diff from another model.
 
+## Register with Codex
+
+[Codex CLI](https://github.com/openai/codex) (the `codex` command) keeps its MCP
+servers in `~/.codex/config.toml`. Add one via the CLI:
+
+```bash
+codex mcp add secondopinion \
+  --env SECONDOPINION_MCP_CONFIG=/path/to/SecondOpinion-MCP/secondopinion.toml \
+  -- /path/to/SecondOpinion-MCP/.venv/bin/secondopinion-mcp
+```
+
+`codex mcp add` has no `--cwd` flag, so `./secondopinion.toml` is *not*
+auto-discovered — pass the config file explicitly with `--env` as above (use an
+absolute path).
+
+### Or write it directly into `~/.codex/config.toml`
+
+```toml
+[mcp_servers.secondopinion]
+command = "/path/to/SecondOpinion-MCP/.venv/bin/secondopinion-mcp"
+env = { SECONDOPINION_MCP_CONFIG = "/path/to/SecondOpinion-MCP/secondopinion.toml" }
+```
+
+The `python -m` form works too:
+
+```toml
+[mcp_servers.secondopinion]
+command = "/path/to/SecondOpinion-MCP/.venv/bin/python"
+args = ["-m", "secondopinion_mcp"]
+env = { SECONDOPINION_MCP_CONFIG = "/path/to/SecondOpinion-MCP/secondopinion.toml" }
+```
+
+Verify with `codex mcp list` and `codex mcp get secondopinion`. The `opencode`
+binary is located the same way as described above. If `opencode serve` is slow
+to boot and Codex times out while registering the server, add
+`startup_timeout_sec = 30` to the `[mcp_servers.secondopinion]` table.
+
 ## Usage examples
 
 One-shot review:

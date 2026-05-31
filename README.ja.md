@@ -180,6 +180,37 @@ MCP ホスト (Claude Desktop, Claude Code 等) はサブプロセスを最小 P
 
 > 別モデルで `secondopinion` を使ってこの diff のセカンドオピニオンを取って。
 
+## Codex への登録
+
+[Codex CLI](https://github.com/openai/codex) (`codex` コマンド) は MCP サーバーを `~/.codex/config.toml` に保存します。CLI 経由で追加するには:
+
+```bash
+codex mcp add secondopinion \
+  --env SECONDOPINION_MCP_CONFIG=/path/to/SecondOpinion-MCP/secondopinion.toml \
+  -- /path/to/SecondOpinion-MCP/.venv/bin/secondopinion-mcp
+```
+
+`codex mcp add` には `--cwd` フラグが無いため、`./secondopinion.toml` の自動探索は効きません。上記のように `--env` で設定ファイルを**絶対パス**で明示してください。
+
+### `~/.codex/config.toml` に直接書く場合
+
+```toml
+[mcp_servers.secondopinion]
+command = "/path/to/SecondOpinion-MCP/.venv/bin/secondopinion-mcp"
+env = { SECONDOPINION_MCP_CONFIG = "/path/to/SecondOpinion-MCP/secondopinion.toml" }
+```
+
+`python -m` 形式でも構いません:
+
+```toml
+[mcp_servers.secondopinion]
+command = "/path/to/SecondOpinion-MCP/.venv/bin/python"
+args = ["-m", "secondopinion_mcp"]
+env = { SECONDOPINION_MCP_CONFIG = "/path/to/SecondOpinion-MCP/secondopinion.toml" }
+```
+
+`codex mcp list` / `codex mcp get secondopinion` で確認できます。`opencode` バイナリは上記と同じ方法で探索されます。もし `opencode serve` の初回起動が遅く、サーバー登録時に Codex がタイムアウトする場合は、`[mcp_servers.secondopinion]` テーブルに `startup_timeout_sec = 30` を追記してください。
+
 ## 使い方
 
 ワンショットのレビュー:
