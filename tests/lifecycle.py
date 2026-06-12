@@ -22,6 +22,7 @@ from secondopinion_mcp.opencode_client import (
     MessageResult,
     OpencodeClient,
     TransportStall,
+    _parse_message_response,
 )
 from secondopinion_mcp.server import (
     AppState,
@@ -139,6 +140,42 @@ async def test_fetch_result_500_returns_none() -> None:
         check("returns None without raising", result is None)
     finally:
         await client._http.aclose()
+
+
+# ---------------------------------------------------------------------------
+# [_parse_message_response: thinking extraction]
+# ---------------------------------------------------------------------------
+
+def test_parse_extracts_thinking() -> None:
+    print("[_parse_message_response: reasoning parts -> thinking]")
+    # opencode labels reasoning parts variously and may carry the text under
+    # "text", "content", or "summary" — all three should be picked up, in order.
+    data = {
+        "info": {"tokens": {"input": 1}},
+        "parts": [
+            {"type": "reasoning", "text": "first thought"},
+            {"type": "thinking", "content": "second thought"},
+            {"type": "reasoning-summary", "summary": "third thought"},
+            {"type": "text", "text": "the answer"},
+            {"type": "step-finish", "reason": "stop"},
+        ],
+    }
+    result = _parse_message_response(SID, data)
+    check("text excludes reasoning", result.text == "the answer")
+    check("finish_reason parsed", result.finish_reason == "stop")
+    check(
+        "thinking joins all three reasoning parts in order",
+        result.thinking == "first thought\n\nsecond thought\n\nthird thought",
+        f"thinking={result.thinking!r}",
+    )
+
+
+def test_parse_thinking_empty_when_absent() -> None:
+    print("[_parse_message_response: no reasoning parts -> empty thinking]")
+    data = {"info": {"tokens": {}}, "parts": [{"type": "text", "text": "plain"}]}
+    result = _parse_message_response(SID, data)
+    check("text is 'plain'", result.text == "plain")
+    check("thinking is empty string", result.thinking == "")
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +313,8 @@ async def main() -> int:
     await test_fetch_result_busy_returns_none()
     await test_fetch_result_missing_session_no_assistant()
     await test_fetch_result_500_returns_none()
+    test_parse_extracts_thinking()
+    test_parse_thinking_empty_when_absent()
     await test_wait_done_stores_finished()
     await test_wait_transport_marks_recovering()
     await test_wait_error_deletes_second_opinion_session()
