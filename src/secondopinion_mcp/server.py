@@ -45,7 +45,12 @@ class Job:
 class FinishedJob:
     payload: dict
     finished_at: float
-    delivered: int = 0
+    # Every FinishedJob is constructed at the moment its payload is also being
+    # returned to the caller — that store *is* the first delivery. Starting at 1
+    # (not 0) means the first *re*-poll bumps this to 2 and correctly earns the
+    # "re-delivered" note; starting at 0 would silently swallow the warning on
+    # the first re-poll, which is exactly the case the note exists for.
+    delivered: int = 1
 
 
 @dataclass
