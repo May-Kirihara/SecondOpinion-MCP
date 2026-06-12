@@ -39,6 +39,17 @@ request_timeout_s = 600   # generous — second opinions can take a while
 # margin. Set to 0 to disable the watchdog (legacy behaviour).
 stall_idle_timeout_s = 30
 
+# Cold-start grace for the watchdog. Until the FIRST session-scoped event
+# arrives this (larger) threshold is used instead of `stall_idle_timeout_s`,
+# so a backend that is still spawning or loading a model doesn't get killed
+# as a false stall. After the first event the normal idle threshold applies.
+stall_first_event_grace_s = 120
+
+# How long finished job results (success or error) are retained so the caller
+# can re-poll an already-collected `job_id` and get the same result
+# re-delivered (e.g. after the caller's own tool call timed out mid-poll).
+job_result_ttl_s = 600
+
 # Hybrid async wait window. `second_opinion` / `delegate_task` / `poll_task`
 # block at most this many seconds for a reply; if the external model is still
 # thinking they return `status:"running"` with a `job_id` the caller polls via

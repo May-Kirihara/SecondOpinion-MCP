@@ -137,6 +137,7 @@ class OpencodeClient:
         self._http: httpx.AsyncClient | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._startup_lock = asyncio.Lock()
+        self.session_activity: dict[str, float] = {}
 
     @property
     def base_url(self) -> str:
@@ -270,6 +271,7 @@ class OpencodeClient:
         return data["id"]
 
     async def delete_session(self, session_id: str) -> None:
+        self.session_activity.pop(session_id, None)
         try:
             r = await self.http.delete(f"/session/{session_id}")
             r.raise_for_status()
@@ -315,12 +317,45 @@ class OpencodeClient:
         data = r.json()
         return _parse_message_response(session_id, data)
 
+    async def fetch_session_result(self, session_id: str) -> MessageResult | None:
+        """Recover a finished reply after a transport error.
+
+        GET /session/status → if the session is idle, fetch the last assistant
+        message from /session/{id}/message and parse it. Returns None if the
+        session is still busy, has no assistant message, or on any HTTP error.
+        Never raises.
+        """
+        try:
+            status_r = await self.http.get("/session/status")
+            status_r.raise_for_status()
+            status_map = status_r.json()
+            entry = status_map.get(session_id)
+            if entry is None or (isinstance(entry, dict) and entry.get("type") == "idle"):
+                pass
+            else:
+                return None
+
+            msg_r = await self.http.get(f"/session/{session_id}/message")
+            msg_r.raise_for_status()
+            messages = msg_r.json()
+            if not isinstance(messages, list):
+                return None
+            for elem in reversed(messages):
+                info = elem.get("info", {}) or {}
+                if info.get("role") == "assistant":
+                    return _parse_message_response(session_id, elem)
+            return None
+        except httpx.HTTPError as exc:
+            log.warning("fetch_session_result(%s) failed: %s", session_id, exc)
+            return None
+
     async def _liveness_from_events(
         self,
         session_id: str,
         beat: Callable[[], None],
         attached: asyncio.Event,
         stop: asyncio.Event,
+        session_beat: Callable[[], None] | None = None,
     ) -> None:
         """Consume the `/event` SSE stream and call `beat()` on every event
         that proves *this* request is still progressing. Best-effort: if the
@@ -347,6 +382,9 @@ class OpencodeClient:
                         continue
                     if isinstance(ev, dict) and _event_is_live(ev, session_id):
                         beat()
+                        self.session_activity[session_id] = time.monotonic()
+                        if session_beat is not None:
+                            session_beat()
         except (httpx.HTTPError, httpx.StreamError, asyncio.TimeoutError):
             return
 
@@ -366,18 +404,26 @@ class OpencodeClient:
         idle clock).
         """
         last = [time.monotonic()]
+        session_event_seen = [False]
         attached = asyncio.Event()
         stop = asyncio.Event()
 
         def beat() -> None:
             last[0] = time.monotonic()
 
+        def session_beat() -> None:
+            session_event_seen[0] = True
+
+        grace = self.config.server.stall_first_event_grace_s
         sse = asyncio.create_task(
-            self._liveness_from_events(session_id, beat, attached, stop)
+            self._liveness_from_events(
+                session_id, beat, attached, stop, session_beat
+            )
         )
         post = asyncio.create_task(self.http.post(path, json=body))
         try:
             while True:
+                threshold = max(idle, grace) if not session_event_seen[0] else idle
                 done, _ = await asyncio.wait({post}, timeout=min(idle, 5.0))
                 if post in done:
                     return post.result()
@@ -385,12 +431,12 @@ class OpencodeClient:
                 # POST's own httpx wall-clock timeout (legacy safety).
                 if sse.done() and not attached.is_set():
                     return await post
-                if attached.is_set() and time.monotonic() - last[0] > idle:
+                if attached.is_set() and time.monotonic() - last[0] > threshold:
                     post.cancel()
                     with suppress(asyncio.CancelledError, Exception):
                         await post
                     raise TransportStall(
-                        f"no opencode liveness for {idle:.0f}s "
+                        f"no opencode liveness for {threshold:.0f}s "
                         f"(session {session_id}); connection stalled"
                     )
         finally:
