@@ -30,6 +30,14 @@ MCP サーバーは起動時にローカルのランダムポートで `opencode
 
 このプロトコルは MCP の `instructions` と各ツールの説明文に明記してあるため、行儀のよい呼び出し側エージェントは諦めずに poll します。
 
+`running` の間、payload には `last_activity_ago_s`（セッションスコープの SSE イベントを最後に観測してからの秒数）が含まれます。「生きているが遅い」（値が小さい）のか「死んでいる」（値が増え続ける）のかを呼び出し側が判断できます。
+
+### transport エラーからの結果リカバリと結果の保持
+
+HTTP リクエストが ReadTimeout や transport stall で死んでも、opencode は裏で作業を完了していることがよくあります。サーバーはこれをエラーとして握りつぶす代わりに、ジョブを `{"status": "recovering"}`（元のエラーは `transport_error` に格納）へ遷移させ、以後の `poll_task` のたびに opencode セッションが idle になったかを確認して、完了済みのアシスタント応答をセッションから回収します。呼び出し側は `recovering` を `running` と同じように扱い、poll を続けてください。リカバリを諦めてエラーを返すのは、ジョブ開始から `server.request_timeout_s` を超えたときだけです。
+
+完了したジョブの結果（成功・エラーとも）は `server.job_result_ttl_s`（既定 600 秒、直近 100 件まで）保持されます。poll の途中で呼び出し側自身がタイムアウトして応答を取り逃しても、同じ `job_id` を再 poll すれば `unknown job_id` ではなく同じ結果が再配達されます。
+
 ## インストール
 
 必要要件: Python 3.11+ / [`opencode`](https://opencode.ai/) がインストール済みで認証済み (`opencode providers` で確認) / `uv` (推奨) または `pip`。
@@ -243,9 +251,13 @@ end_session(session_id=r["session_id"])
 - `[server]` — port (`0` でランダム)、hostname、各種タイムアウト。
   `stall_idle_timeout_s` は SSE 生存 watchdog の閾値: opencode の動きが
   この秒数途絶えたリクエストを、`request_timeout_s` を丸ごと待たずに
-  transport stall として即座に失敗させる (`0` で無効)。`wait_window_s`
+  transport stall として即座に失敗させる (`0` で無効)。
+  `stall_first_event_grace_s` (既定 120) はコールドスタート猶予:
+  最初のセッションスコープイベントが届くまではこちらを閾値に使い、
+  モデルの起動・ロード中に watchdog が誤発しないようにする。`wait_window_s`
   (既定 20) は非同期ツールが `running` ハンドルを返すまでにブロックする秒数。
-  呼び出し側ホストのツールタイムアウトより短く保つこと。
+  呼び出し側ホストのツールタイムアウトより短く保つこと。`job_result_ttl_s`
+  (既定 600) は完了したジョブ結果を再 poll 用に保持する秒数。
 - `[tools.<tool_name>]` — ツール単位の `agent` と `system_prompt` 上書き。
 
 ## 環境変数

@@ -52,8 +52,15 @@ async def _sse_loop(delay: float, payload: dict):
         yield _sse_line(payload)
 
 
-def _make_client(handler, idle: float) -> OpencodeClient:
-    cfg = Config(server=ServerOpts(stall_idle_timeout_s=idle))
+def _make_client(handler, idle: float, grace: float | None = None) -> OpencodeClient:
+    # grace=None pins the cold-start grace to `idle` so the legacy checks keep
+    # exercising the plain idle threshold; pass a larger grace to test it.
+    cfg = Config(
+        server=ServerOpts(
+            stall_idle_timeout_s=idle,
+            stall_first_event_grace_s=idle if grace is None else grace,
+        )
+    )
     client = OpencodeClient(cfg)
     client._http = httpx.AsyncClient(
         base_url="http://mock", transport=httpx.MockTransport(handler)
@@ -175,6 +182,68 @@ async def test_sse_unavailable_falls_back() -> None:
         await client._http.aclose()
 
 
+async def test_cold_start_grace() -> None:
+    print("[cold start — first-event grace]")
+
+    async def slow_first_event_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/event":
+            async def stream():
+                # First session-scoped event arrives after the idle threshold
+                # but inside the grace window — a model still loading.
+                await asyncio.sleep(0.5)
+                yield _sse_line(
+                    {"type": "message.part.delta", "properties": {"sessionID": SID}}
+                )
+                async for chunk in _sse_loop(
+                    0.1, {"type": "message.part.delta", "properties": {"sessionID": SID}}
+                ):
+                    yield chunk
+            return httpx.Response(200, content=stream())
+        await asyncio.sleep(0.9)
+        return httpx.Response(200, json={"ok": True})
+
+    client = _make_client(slow_first_event_handler, idle=0.2, grace=2.0)
+    try:
+        r = await client._post_with_stall_watchdog(
+            f"/session/{SID}/message", {"x": 1}, SID, 0.2
+        )
+        check("slow first event within grace does not stall", r.status_code == 200)
+    except TransportStall as e:
+        check("slow first event within grace does not stall", False, f"raised {e!r}")
+    finally:
+        await client._http.aclose()
+
+    async def events_then_silence_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/event":
+            async def stream():
+                yield _sse_line(
+                    {"type": "message.part.delta", "properties": {"sessionID": SID}}
+                )
+                await asyncio.sleep(3600)  # then silence — a mid-turn stall
+            return httpx.Response(200, content=stream())
+        await asyncio.sleep(3600)
+        return httpx.Response(200, json={})
+
+    client = _make_client(events_then_silence_handler, idle=0.4, grace=30.0)
+    loop = asyncio.get_event_loop()
+    t0 = loop.time()
+    raised = False
+    try:
+        await client._post_with_stall_watchdog(
+            f"/session/{SID}/message", {"x": 1}, SID, 0.4
+        )
+    except TransportStall:
+        raised = True
+    elapsed = loop.time() - t0
+    await client._http.aclose()
+    check("after first session event the idle threshold applies", raised)
+    check(
+        "mid-turn stall detected at idle speed, not grace",
+        elapsed < 5.0,
+        f"detected in {elapsed:.2f}s",
+    )
+
+
 async def test_legacy_bypass() -> None:
     print("[stall_idle_timeout_s = 0 — legacy bypass]")
     seen: set[str] = set()
@@ -204,6 +273,7 @@ async def main() -> int:
     await test_healthy_returns()
     await test_stall_raises()
     await test_sse_unavailable_falls_back()
+    await test_cold_start_grace()
     await test_legacy_bypass()
 
     failed = [n for n, ok, _ in _results if not ok]

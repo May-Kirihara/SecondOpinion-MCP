@@ -46,6 +46,27 @@ timeout (often ~60s), `second_opinion` and `delegate_task` are asynchronous:
 The server advertises this protocol in its MCP `instructions` and each tool's
 description, so a well-behaved calling agent polls instead of giving up.
 
+While a job is `running`, the payload includes `last_activity_ago_s` — seconds
+since the last session-scoped SSE event — so a caller can tell an
+alive-but-slow model (small values) from a dead one (steadily growing values).
+
+### Transport-error recovery and result retention
+
+opencode usually finishes the work even when the HTTP request carrying it
+dies (a `ReadTimeout` or a detected transport stall). Instead of surfacing
+those as errors and losing the reply, the server marks the job
+`{"status": "recovering"}` (with the original error under `transport_error`)
+and, on each subsequent `poll_task`, checks whether the opencode session went
+idle and recovers the finished assistant reply from it. Callers should treat
+`recovering` exactly like `running`: keep polling. Recovery gives up — and
+reports an error — only after `server.request_timeout_s` from job start.
+
+Finished results (success or error) are also retained for
+`server.job_result_ttl_s` (default 600s, capped at the 100 most recent), so a
+caller that missed a reply — e.g. its own tool call timed out mid-poll — can
+re-poll the same `job_id` and get the result re-delivered instead of
+`unknown job_id`.
+
 ## Install
 
 Requires Python 3.11+, [`opencode`](https://opencode.ai/) installed and
@@ -279,9 +300,13 @@ See `config.example.toml`. Notable knobs:
 - `[server]` — port (0 = random), hostname, timeouts. `stall_idle_timeout_s`
   controls the SSE-liveness watchdog: a request with no opencode activity for
   that many seconds is failed fast as a transport stall instead of blocking the
-  full `request_timeout_s` (set 0 to disable). `wait_window_s` (default 20) is
+  full `request_timeout_s` (set 0 to disable). `stall_first_event_grace_s`
+  (default 120) is the cold-start grace: the idle threshold used until the
+  first session-scoped event arrives, so a model that is still spawning or
+  loading doesn't trip the watchdog. `wait_window_s` (default 20) is
   how long the async tools block before returning a pollable `running` handle —
-  keep it under the calling host's per-tool timeout.
+  keep it under the calling host's per-tool timeout. `job_result_ttl_s`
+  (default 600) is how long finished job results are retained for re-polling.
 - `[tools.<tool_name>]` — per-tool overrides for `agent` and `system_prompt`.
 
 ## Environment variables

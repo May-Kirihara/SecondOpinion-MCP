@@ -13,11 +13,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, AsyncIterator, Awaitable, TypedDict
 
+import httpx
 from mcp.server.fastmcp import Context, FastMCP
 from pydantic import Field
 
 from .config import Config, ConfigError, Provider, load_config
-from .opencode_client import MessageResult, OpencodeClient
+from .opencode_client import MessageResult, OpencodeClient, TransportStall
 
 
 log = logging.getLogger("secondopinion_mcp")
@@ -35,6 +36,16 @@ class Job:
     session_id: str
     started: float
     expose_session: bool  # delegate_task can be continued; second_opinion can't
+    recovering: bool = False
+    recovery_busy: bool = False
+    last_error: str | None = None
+
+
+@dataclass
+class FinishedJob:
+    payload: dict
+    finished_at: float
+    delivered: int = 0
 
 
 @dataclass
@@ -42,6 +53,7 @@ class AppState:
     config: Config
     client: OpencodeClient
     jobs: dict[str, Job] = field(default_factory=dict)
+    finished: dict[str, FinishedJob] = field(default_factory=dict)
 
 
 @asynccontextmanager
@@ -120,12 +132,15 @@ def _done_payload(job: Job, result: MessageResult) -> dict[str, Any]:
     return payload
 
 
-def _running_payload(job_id: str, job: Job) -> dict[str, Any]:
+def _running_payload(state: AppState, job_id: str, job: Job) -> dict[str, Any]:
     elapsed = round(time.monotonic() - job.started, 1)
     payload: dict[str, Any] = {
         "status": "running",
         "job_id": job_id,
         "elapsed_s": elapsed,
+        "last_activity_ago_s": round(
+            time.monotonic() - state.client.session_activity.get(job.session_id, job.started), 1
+        ),
         "hint": (
             f"The external model is still thinking ({elapsed:.0f}s elapsed) — this is "
             f"NORMAL, not a hang or an error. Do NOT abort, retry, or start a new "
@@ -138,28 +153,68 @@ def _running_payload(job_id: str, job: Job) -> dict[str, Any]:
     return payload
 
 
+def _recovering_payload(job_id: str, job: Job) -> dict[str, Any]:
+    elapsed = round(time.monotonic() - job.started, 1)
+    payload: dict[str, Any] = {
+        "status": "recovering",
+        "job_id": job_id,
+        "elapsed_s": elapsed,
+        "hint": (
+            "the transport to opencode failed but the model likely kept working; "
+            "keep calling poll_task — the server is recovering the result from the session"
+        ),
+    }
+    if job.last_error is not None:
+        payload["transport_error"] = job.last_error
+    if job.expose_session:
+        payload["session_id"] = job.session_id
+    return payload
+
+
 async def _wait_or_handle(
     state: AppState, job_id: str, job: Job, max_wait_s: float
 ) -> dict[str, Any]:
     """Wait up to `max_wait_s` for `job`. Return the done/error payload (and
-    drop the job) once finished, else a `status:"running"` handle to poll."""
+    move it to finished) once finished, else a `status:"running"` handle to poll.
+    Transport-level errors mark the job as recovering instead of failing it."""
+    if job.recovering:
+        return _recovering_payload(job_id, job)
     done, _ = await asyncio.wait({job.task}, timeout=max_wait_s)
     if job.task not in done:
-        return _running_payload(job_id, job)
-    state.jobs.pop(job_id, None)
+        return _running_payload(state, job_id, job)
     try:
         result = job.task.result()
     except asyncio.CancelledError:
-        return {"status": "error", "job_id": job_id, "error": "job was cancelled"}
-    except Exception as e:  # surface the failure instead of hanging the caller
+        payload: dict[str, Any] = {
+            "status": "error",
+            "job_id": job_id,
+            "error": "job was cancelled",
+        }
+        state.finished[job_id] = FinishedJob(payload=payload, finished_at=time.monotonic())
+        state.jobs.pop(job_id, None)
+        return payload
+    except (TransportStall, httpx.TransportError, httpx.TimeoutException) as te:
+        log.warning("job %s (%s) hit transport error, marking recovering", job_id, job.kind)
+        job.last_error = f"{type(te).__name__}: {te}"
+        job.recovering = True
+        return _recovering_payload(job_id, job)
+    except Exception as e:
         log.warning("job %s (%s) failed: %s", job_id, job.kind, e)
-        return {
+        payload = {
             "status": "error",
             "job_id": job_id,
             "error": f"{type(e).__name__}: {e}",
             "provider": _provider_info(job.provider),
         }
-    return _done_payload(job, result)
+        state.finished[job_id] = FinishedJob(payload=payload, finished_at=time.monotonic())
+        state.jobs.pop(job_id, None)
+        if job.kind == "second_opinion":
+            await state.client.delete_session(job.session_id)
+        return payload
+    payload = _done_payload(job, result)
+    state.finished[job_id] = FinishedJob(payload=payload, finished_at=time.monotonic())
+    state.jobs.pop(job_id, None)
+    return payload
 
 
 def _resolve_wait(state: AppState, max_wait_s: float | None) -> float:
@@ -188,6 +243,11 @@ def build_server() -> FastMCP:
         "repeat poll_task until `status` is `\"done\"`. Do NOT abort, do NOT retry the "
         "original request, and do NOT give up — the external model is still working "
         "server-side and your job is preserved across polls.\n"
+        "  - `status:\"recovering\"` means the transport to opencode hiccuped but the "
+        "model most likely kept working; the server is recovering the finished reply "
+        "from the session. Treat it exactly like `running`: keep calling poll_task.\n"
+        "  - Finished results are retained for a while, so re-polling a job_id you "
+        "already collected re-delivers the same result instead of erroring.\n"
         "\n"
         "Use `second_opinion` for one-shot reviews and `delegate_task` for multi-turn "
         "interactions that return a `session_id` you can pass back in to continue."
@@ -283,17 +343,16 @@ def build_server() -> FastMCP:
         )
 
         async def _run() -> MessageResult:
-            try:
-                return await state.client.send_message(
-                    session_id=sid,
-                    provider=prov,
-                    agent=agent,
-                    text=prompt,
-                    files=attachments,
-                    system_prompt=system_prompt,
-                )
-            finally:
-                await state.client.delete_session(sid)
+            result = await state.client.send_message(
+                session_id=sid,
+                provider=prov,
+                agent=agent,
+                text=prompt,
+                files=attachments,
+                system_prompt=system_prompt,
+            )
+            await state.client.delete_session(sid)
+            return result
 
         job_id = _register_job(
             state,
@@ -389,8 +448,12 @@ def build_server() -> FastMCP:
             "Resume waiting for a second_opinion / delegate_task job that returned "
             "`status:\"running\"`. Returns `status:\"done\"` with the reply once the "
             "external model finishes, or `status:\"running\"` again if it is still "
-            "working — in which case call poll_task again with the same job_id. Keep "
-            "polling until done; a `running` result is normal and never means failure."
+            "working — in which case call poll_task again with the same job_id. "
+            "`status:\"recovering\"` means a transport error hit but the model likely "
+            "finished anyway; the server is recovering the reply from the session — "
+            "keep polling just like `running`. Finished results are retained for a "
+            "while, so re-polling an already-collected job_id re-delivers the same "
+            "result. `running`/`recovering` are normal and never mean failure."
         )
     )
     async def poll_task(
@@ -409,16 +472,87 @@ def build_server() -> FastMCP:
         ] = None,
     ) -> dict[str, Any]:
         state = _state(ctx)
+
+        now = time.monotonic()
+        ttl = state.config.server.job_result_ttl_s
+        expired = [
+            jid for jid, fj in state.finished.items()
+            if now - fj.finished_at > ttl
+        ]
+        for jid in expired:
+            del state.finished[jid]
+        if len(state.finished) > 100:
+            oldest = sorted(state.finished.items(), key=lambda x: x[1].finished_at)
+            for jid, _ in oldest[:len(oldest) - 100]:
+                del state.finished[jid]
+
+        fj = state.finished.get(job_id)
+        if fj is not None:
+            fj.delivered += 1
+            payload = dict(fj.payload)
+            if fj.delivered > 1:
+                payload["note"] = (
+                    "re-delivered — this result was already collected by an earlier poll"
+                )
+            return payload
+
         job = state.jobs.get(job_id)
         if job is None:
             return {
                 "status": "error",
                 "job_id": job_id,
                 "error": (
-                    "unknown job_id — it already completed and was collected by an "
-                    "earlier poll, or it never existed. Do not poll it again."
+                    "unknown job_id — the job never existed or its retained result "
+                    "expired. Do not poll it again."
                 ),
             }
+
+        if job.recovering:
+            deadline = time.monotonic() + _resolve_wait(state, max_wait_s)
+            while True:
+                if job.recovery_busy:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return _recovering_payload(job_id, job)
+                    await asyncio.sleep(min(5.0, remaining))
+                    continue
+                job.recovery_busy = True
+                try:
+                    result = await state.client.fetch_session_result(job.session_id)
+                    if result is not None and result.text:
+                        payload = _done_payload(job, result)
+                        payload["note"] = "recovered from the session after a transport error"
+                        state.finished[job_id] = FinishedJob(
+                            payload=payload, finished_at=time.monotonic()
+                        )
+                        state.jobs.pop(job_id, None)
+                        if job.kind == "second_opinion":
+                            await state.client.delete_session(job.session_id)
+                        return payload
+                    if time.monotonic() - job.started > state.config.server.request_timeout_s:
+                        payload = {
+                            "status": "error",
+                            "job_id": job_id,
+                            "error": (
+                                "recovery failed — the transport error could not be "
+                                "recovered within the request timeout"
+                            ),
+                            "provider": _provider_info(job.provider),
+                        }
+                        state.finished[job_id] = FinishedJob(
+                            payload=payload, finished_at=time.monotonic()
+                        )
+                        state.jobs.pop(job_id, None)
+                        if job.kind == "second_opinion":
+                            await state.client.delete_session(job.session_id)
+                        return payload
+                finally:
+                    job.recovery_busy = False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return _recovering_payload(job_id, job)
+                await asyncio.sleep(min(5.0, remaining))
+
         return await _wait_or_handle(
             state, job_id, job, _resolve_wait(state, max_wait_s)
         )
