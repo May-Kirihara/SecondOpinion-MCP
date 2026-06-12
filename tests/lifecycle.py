@@ -178,6 +178,22 @@ async def test_wait_done_stores_finished() -> None:
     check("text is hello", payload.get("text") == "hello")
     check("job_id in state.finished", job_id in state.finished)
     check("job_id NOT in state.jobs", job_id not in state.jobs)
+    # The store at completion IS the first delivery (the payload above was just
+    # returned), so delivered starts at 1 — otherwise the first re-poll would
+    # not cross the `> 1` note threshold and silently drop the warning.
+    check(
+        "delivered starts at 1 (the completing return counts as delivery #1)",
+        state.finished[job_id].delivered == 1,
+        f"delivered={state.finished[job_id].delivered}",
+    )
+    # Simulate the first re-poll's increment (poll_task does `delivered += 1`).
+    fj = state.finished[job_id]
+    fj.delivered += 1
+    check(
+        "first re-poll crosses the note threshold",
+        fj.delivered > 1,
+        f"delivered={fj.delivered}",
+    )
     await state.client._http.aclose()
 
 
