@@ -73,6 +73,10 @@ class MessageResult:
     tokens: dict[str, Any] = field(default_factory=dict)
     finish_reason: str | None = None
     raw_parts: list[dict[str, Any]] = field(default_factory=list)
+    # Concatenated reasoning / thinking blocks from the model, if any. Empty
+    # for models (or turns) that emit no separate reasoning parts. Surfaced so
+    # a "second opinion" caller can see *why*, not just the conclusion.
+    thinking: str = ""
 
 
 def _pick_free_port() -> int:
@@ -481,10 +485,16 @@ def _guess_mime(path: Path) -> str:
     return "application/octet-stream"
 
 
+# opencode (or the underlying SDK) labels reasoning parts variously; the text
+# itself may live under "text", "content", or "summary".
+_THINKING_PART_TYPES = {"reasoning", "thinking", "reasoning-summary"}
+
+
 def _parse_message_response(session_id: str, data: dict[str, Any]) -> MessageResult:
     info = data.get("info", {}) or {}
     parts = data.get("parts", []) or []
     text_chunks: list[str] = []
+    thinking_chunks: list[str] = []
     finish_reason: str | None = None
     for p in parts:
         ptype = p.get("type")
@@ -492,6 +502,10 @@ def _parse_message_response(session_id: str, data: dict[str, Any]) -> MessageRes
             t = p.get("text")
             if isinstance(t, str) and t:
                 text_chunks.append(t)
+        elif ptype in _THINKING_PART_TYPES:
+            t = p.get("text") or p.get("content") or p.get("summary")
+            if isinstance(t, str) and t:
+                thinking_chunks.append(t)
         elif ptype == "step-finish":
             finish_reason = p.get("reason") or finish_reason
     return MessageResult(
@@ -500,4 +514,5 @@ def _parse_message_response(session_id: str, data: dict[str, Any]) -> MessageRes
         tokens=dict(info.get("tokens") or {}),
         finish_reason=finish_reason,
         raw_parts=parts,
+        thinking="\n\n".join(thinking_chunks).strip(),
     )

@@ -131,6 +131,10 @@ def _done_payload(job: Job, result: MessageResult) -> dict[str, Any]:
         "finish_reason": result.finish_reason,
         "provider": _provider_info(job.provider),
     }
+    if result.thinking:
+        # Only present when the model emitted separate reasoning parts; keeps
+        # the payload clean for models that don't.
+        payload["thinking"] = result.thinking
     if job.expose_session:
         # delegate_task sessions can be continued; second_opinion's is deleted.
         payload["session_id"] = result.session_id

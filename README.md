@@ -37,7 +37,10 @@ timeout (often ~60s), `second_opinion` and `delegate_task` are asynchronous:
 1. They start the work and wait only a short window (`server.wait_window_s`,
    default 20s, or the per-call `max_wait_s` argument).
 2. If the reply finishes in that window you get `{"status": "done", "text": …}`
-   straight away.
+   straight away. When the model emits separate reasoning, the payload also
+   carries a `thinking` field with its concatenated reasoning blocks (absent
+   for models/turns that produce none) — so you can see *why*, not just the
+   conclusion.
 3. Otherwise you get `{"status": "running", "job_id": …}`. The model keeps
    running server-side; call `poll_task(job_id=…)` to keep waiting and repeat
    until `status` is `"done"`. **A `running` result is normal — do not abort or
