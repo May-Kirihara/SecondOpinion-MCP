@@ -36,6 +36,7 @@ class Job:
     session_id: str
     started: float
     expose_session: bool  # delegate_task can be continued; second_opinion can't
+    session_ready: bool = False
     recovering: bool = False
     recovery_busy: bool = False
     last_error: str | None = None
@@ -71,6 +72,15 @@ async def _lifespan(_: FastMCP) -> AsyncIterator[AppState]:
     client = OpencodeClient(config)
     await client.start()
     state = AppState(config=config, client=client)
+    wws = config.server.wait_window_s
+    if wws > 30:
+        log.warning(
+            "wait_window_s=%.0f is above the recommended maximum of ~25s. "
+            "Large values risk hitting the MCP host's tool-call timeout, "
+            "which is the exact scenario the deferred-session fix was designed "
+            "to avoid.",
+            wws,
+        )
     try:
         yield state
     finally:
@@ -147,9 +157,6 @@ def _running_payload(state: AppState, job_id: str, job: Job) -> dict[str, Any]:
         "status": "running",
         "job_id": job_id,
         "elapsed_s": elapsed,
-        "last_activity_ago_s": round(
-            time.monotonic() - state.client.session_activity.get(job.session_id, job.started), 1
-        ),
         "hint": (
             f"The external model is still thinking ({elapsed:.0f}s elapsed) — this is "
             f"NORMAL, not a hang or an error. Do NOT abort, retry, or start a new "
@@ -157,8 +164,14 @@ def _running_payload(state: AppState, job_id: str, job: Job) -> dict[str, Any]:
             f"repeat until status is 'done'."
         ),
     }
-    if job.expose_session:
+    if job.expose_session and job.session_id:
         payload["session_id"] = job.session_id
+    if job.expose_session and not job.session_id:
+        payload["session_pending"] = True
+    if job.session_id:
+        payload["last_activity_ago_s"] = round(
+            time.monotonic() - state.client.session_activity.get(job.session_id, job.started), 1
+        )
     return payload
 
 
@@ -175,7 +188,7 @@ def _recovering_payload(job_id: str, job: Job) -> dict[str, Any]:
     }
     if job.last_error is not None:
         payload["transport_error"] = job.last_error
-    if job.expose_session:
+    if job.expose_session and job.session_id:
         payload["session_id"] = job.session_id
     return payload
 
@@ -203,6 +216,17 @@ async def _wait_or_handle(
         state.jobs.pop(job_id, None)
         return payload
     except (TransportStall, httpx.TransportError, httpx.TimeoutException) as te:
+        if not job.session_ready:
+            log.warning("job %s (%s) failed during session creation: %s", job_id, job.kind, te)
+            payload = {
+                "status": "error",
+                "job_id": job_id,
+                "error": f"session creation failed: {type(te).__name__}: {te}",
+                "provider": _provider_info(job.provider),
+            }
+            state.finished[job_id] = FinishedJob(payload=payload, finished_at=time.monotonic())
+            state.jobs.pop(job_id, None)
+            return payload
         log.warning("job %s (%s) hit transport error, marking recovering", job_id, job.kind)
         job.last_error = f"{type(te).__name__}: {te}"
         job.recovering = True
@@ -217,7 +241,7 @@ async def _wait_or_handle(
         }
         state.finished[job_id] = FinishedJob(payload=payload, finished_at=time.monotonic())
         state.jobs.pop(job_id, None)
-        if job.kind == "second_opinion":
+        if job.kind == "second_opinion" and job.session_id:
             await state.client.delete_session(job.session_id)
         return payload
     payload = _done_payload(job, result)
@@ -257,6 +281,10 @@ def build_server() -> FastMCP:
         "from the session. Treat it exactly like `running`: keep calling poll_task.\n"
         "  - Finished results are retained for a while, so re-polling a job_id you "
         "already collected re-delivers the same result instead of erroring.\n"
+        "  - For `delegate_task` with a new session, the initial `running` response "
+        "may include `session_pending: true` instead of `session_id` if session "
+        "creation has not completed yet. Poll until `session_id` appears or the job "
+        "completes/errors.\n"
         "\n"
         "Use `second_opinion` for one-shot reviews and `delegate_task` for multi-turn "
         "interactions that return a `session_id` you can pass back in to continue."
@@ -347,11 +375,12 @@ def build_server() -> FastMCP:
 
         attachments = _resolve_files(files)
 
-        sid = await state.client.create_session(
-            provider=prov, agent=agent, title="second_opinion"
-        )
-
         async def _run() -> MessageResult:
+            sid = await state.client.create_session(
+                provider=prov, agent=agent, title="second_opinion"
+            )
+            state.jobs[job_id].session_id = sid
+            state.jobs[job_id].session_ready = True
             result = await state.client.send_message(
                 session_id=sid,
                 provider=prov,
@@ -368,7 +397,7 @@ def build_server() -> FastMCP:
             coro=_run(),
             kind="second_opinion",
             provider=prov,
-            session_id=sid,
+            session_id="",
             expose_session=False,
         )
         return await _wait_or_handle(
@@ -383,7 +412,11 @@ def build_server() -> FastMCP:
             "SLOW BY DESIGN: returns `status:\"done\"` if the reply finishes in the short "
             "wait window, otherwise `status:\"running\"` with a `job_id` (and the "
             "`session_id`) — that is normal, not a failure. On `running`, poll with "
-            "poll_task(job_id) until done; never abort or retry."
+            "poll_task(job_id) until done; never abort or retry.\n"
+            "Note: for new sessions, the initial `running` response may include "
+            "`session_pending: true` instead of `session_id` if session creation "
+            "has not completed yet. Poll until `session_id` appears or the job "
+            "completes/errors."
         )
     )
     async def delegate_task(
@@ -427,27 +460,41 @@ def build_server() -> FastMCP:
 
         attachments = _resolve_files(files)
 
-        if session_id is None:
-            session_id = await state.client.create_session(
-                provider=prov, agent=agent, title="delegate_task"
-            )
+        _sid = session_id
 
-        coro = state.client.send_message(
-            session_id=session_id,
-            provider=prov,
-            agent=agent,
-            text=task,
-            files=attachments,
-            system_prompt=system_prompt,
-        )
+        if _sid is not None:
+            session_ready = True
+        else:
+            session_ready = False
+
+        async def _run() -> MessageResult:
+            nonlocal _sid
+            if _sid is None:
+                _sid = await state.client.create_session(
+                    provider=prov, agent=agent, title="delegate_task"
+                )
+                state.jobs[job_id].session_id = _sid
+                state.jobs[job_id].session_ready = True
+            result = await state.client.send_message(
+                session_id=_sid,
+                provider=prov,
+                agent=agent,
+                text=task,
+                files=attachments,
+                system_prompt=system_prompt,
+            )
+            return result
+
         job_id = _register_job(
             state,
-            coro=coro,
+            coro=_run(),
             kind="delegate_task",
             provider=prov,
-            session_id=session_id,
+            session_id=_sid or "",
             expose_session=True,
         )
+        if session_ready:
+            state.jobs[job_id].session_ready = True
         return await _wait_or_handle(
             state, job_id, state.jobs[job_id], _resolve_wait(state, max_wait_s)
         )
@@ -517,6 +564,18 @@ def build_server() -> FastMCP:
             }
 
         if job.recovering:
+            if not job.session_id:
+                payload = {
+                    "status": "error",
+                    "job_id": job_id,
+                    "error": "recovery impossible: session not established",
+                    "provider": _provider_info(job.provider),
+                }
+                state.finished[job_id] = FinishedJob(
+                    payload=payload, finished_at=time.monotonic()
+                )
+                state.jobs.pop(job_id, None)
+                return payload
             deadline = time.monotonic() + _resolve_wait(state, max_wait_s)
             while True:
                 if job.recovery_busy:
@@ -535,7 +594,7 @@ def build_server() -> FastMCP:
                             payload=payload, finished_at=time.monotonic()
                         )
                         state.jobs.pop(job_id, None)
-                        if job.kind == "second_opinion":
+                        if job.kind == "second_opinion" and job.session_id:
                             await state.client.delete_session(job.session_id)
                         return payload
                     if time.monotonic() - job.started > state.config.server.request_timeout_s:
@@ -552,7 +611,7 @@ def build_server() -> FastMCP:
                             payload=payload, finished_at=time.monotonic()
                         )
                         state.jobs.pop(job_id, None)
-                        if job.kind == "second_opinion":
+                        if job.kind == "second_opinion" and job.session_id:
                             await state.client.delete_session(job.session_id)
                         return payload
                 finally:
