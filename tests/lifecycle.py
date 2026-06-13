@@ -254,6 +254,7 @@ async def test_wait_transport_marks_recovering() -> None:
         session_id=SID,
         started=__import__("time").monotonic(),
         expose_session=True,
+        session_ready=True,
     )
     state.jobs[job_id] = job
 
@@ -296,6 +297,7 @@ async def test_wait_error_deletes_second_opinion_session() -> None:
         session_id=SID,
         started=__import__("time").monotonic(),
         expose_session=False,
+        session_ready=True,
     )
     state.jobs[job_id] = job
 

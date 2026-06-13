@@ -55,7 +55,8 @@ job_result_ttl_s = 600
 # thinking they return `status:"running"` with a `job_id` the caller polls via
 # `poll_task` (the model keeps running server-side). Keep this well under the
 # calling MCP host's per-tool timeout (often ~60s) so the call returns before
-# the host kills it. Override per-call with the tools' `max_wait_s` argument.
+# the host kills it. Recommended: 15-25s. Override per-call with the tools'
+# `max_wait_s` argument.
 wait_window_s = 20
 
 # ----- Providers ------------------------------------------------------------
