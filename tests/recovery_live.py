@@ -102,7 +102,7 @@ async def main() -> int:
 
                 print("--- second_opinion (tiny idle, expect a stall) ---")
                 result = await session.call_tool(
-                    "second_opinion", {"question": _HEAVY_PROMPT, "max_wait_s": 5}
+                    "second_opinion", {"question": _HEAVY_PROMPT}
                 )
                 env_ = _envelope(result)
 
@@ -122,7 +122,7 @@ async def main() -> int:
                         f") — poll {polls}"
                     )
                     result = await session.call_tool(
-                        "poll_task", {"job_id": env_["job_id"], "max_wait_s": 5}
+                        "poll_task", {"job_id": env_["job_id"]}
                     )
                     env_ = _envelope(result)
 

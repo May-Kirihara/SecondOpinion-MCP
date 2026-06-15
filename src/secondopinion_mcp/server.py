@@ -72,15 +72,6 @@ async def _lifespan(_: FastMCP) -> AsyncIterator[AppState]:
     client = OpencodeClient(config)
     await client.start()
     state = AppState(config=config, client=client)
-    wws = config.server.wait_window_s
-    if wws > 30:
-        log.warning(
-            "wait_window_s=%.0f is above the recommended maximum of ~25s. "
-            "Large values risk hitting the MCP host's tool-call timeout, "
-            "which is the exact scenario the deferred-session fix was designed "
-            "to avoid.",
-            wws,
-        )
     try:
         yield state
     finally:
@@ -194,14 +185,14 @@ def _recovering_payload(job_id: str, job: Job) -> dict[str, Any]:
 
 
 async def _wait_or_handle(
-    state: AppState, job_id: str, job: Job, max_wait_s: float
+    state: AppState, job_id: str, job: Job, wait_s: float
 ) -> dict[str, Any]:
-    """Wait up to `max_wait_s` for `job`. Return the done/error payload (and
+    """Wait up to `wait_s` for `job`. Return the done/error payload (and
     move it to finished) once finished, else a `status:"running"` handle to poll.
     Transport-level errors mark the job as recovering instead of failing it."""
     if job.recovering:
         return _recovering_payload(job_id, job)
-    done, _ = await asyncio.wait({job.task}, timeout=max_wait_s)
+    done, _ = await asyncio.wait({job.task}, timeout=wait_s)
     if job.task not in done:
         return _running_payload(state, job_id, job)
     try:
@@ -250,9 +241,12 @@ async def _wait_or_handle(
     return payload
 
 
-def _resolve_wait(state: AppState, max_wait_s: float | None) -> float:
-    window = state.config.server.wait_window_s if max_wait_s is None else max_wait_s
-    # Never block past the underlying request wall-clock; never below 1s.
+def _resolve_wait(state: AppState) -> float:
+    """Resolve the inline wait window. Always uses ``server.wait_window_s``;
+    per-call override was removed because letting callers extend the wait
+    past the MCP host's tool-call timeout caused chronic -32001 errors.
+    Never blocks past the underlying request wall-clock; never below 1s."""
+    window = state.config.server.wait_window_s
     return max(1.0, min(float(window), state.config.server.request_timeout_s))
 
 
@@ -352,14 +346,6 @@ def build_server() -> FastMCP:
                 description="Provider name from config (e.g. 'glm'). Omit to use the default.",
             ),
         ] = None,
-        max_wait_s: Annotated[
-            float | None,
-            Field(
-                default=None,
-                description="Seconds to wait inline before returning a pollable handle. "
-                "Omit to use the server default (server.wait_window_s).",
-            ),
-        ] = None,
     ) -> dict[str, Any]:
         state = _state(ctx)
         prov = state.config.provider(provider)
@@ -401,7 +387,7 @@ def build_server() -> FastMCP:
             expose_session=False,
         )
         return await _wait_or_handle(
-            state, job_id, state.jobs[job_id], _resolve_wait(state, max_wait_s)
+            state, job_id, state.jobs[job_id], _resolve_wait(state)
         )
 
     @mcp.tool(
@@ -441,14 +427,6 @@ def build_server() -> FastMCP:
             Field(
                 default=None,
                 description="Existing session id to continue. Omit to start a new session.",
-            ),
-        ] = None,
-        max_wait_s: Annotated[
-            float | None,
-            Field(
-                default=None,
-                description="Seconds to wait inline before returning a pollable handle. "
-                "Omit to use the server default (server.wait_window_s).",
             ),
         ] = None,
     ) -> dict[str, Any]:
@@ -496,7 +474,7 @@ def build_server() -> FastMCP:
         if session_ready:
             state.jobs[job_id].session_ready = True
         return await _wait_or_handle(
-            state, job_id, state.jobs[job_id], _resolve_wait(state, max_wait_s)
+            state, job_id, state.jobs[job_id], _resolve_wait(state)
         )
 
     @mcp.tool(
@@ -518,14 +496,6 @@ def build_server() -> FastMCP:
             str,
             Field(description="The job_id returned by second_opinion or delegate_task."),
         ],
-        max_wait_s: Annotated[
-            float | None,
-            Field(
-                default=None,
-                description="Seconds to wait this poll before returning. "
-                "Omit to use the server default (server.wait_window_s).",
-            ),
-        ] = None,
     ) -> dict[str, Any]:
         state = _state(ctx)
 
@@ -576,7 +546,7 @@ def build_server() -> FastMCP:
                 )
                 state.jobs.pop(job_id, None)
                 return payload
-            deadline = time.monotonic() + _resolve_wait(state, max_wait_s)
+            deadline = time.monotonic() + _resolve_wait(state)
             while True:
                 if job.recovery_busy:
                     remaining = deadline - time.monotonic()
@@ -622,7 +592,7 @@ def build_server() -> FastMCP:
                 await asyncio.sleep(min(5.0, remaining))
 
         return await _wait_or_handle(
-            state, job_id, job, _resolve_wait(state, max_wait_s)
+            state, job_id, job, _resolve_wait(state)
         )
 
     @mcp.tool(description="End a delegate_task session and free its resources.")
