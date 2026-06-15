@@ -35,7 +35,7 @@ to several minutes. To avoid tripping the **calling** MCP host's per-tool
 timeout (often ~60s), `second_opinion` and `delegate_task` are asynchronous:
 
 1. They start the work and wait only a short window (`server.wait_window_s`,
-   default 20s, or the per-call `max_wait_s` argument).
+   default 20s, hard-capped at 25s).
 2. If the reply finishes in that window you get `{"status": "done", "text": …}`
    straight away. When the model emits separate reasoning, the payload also
    carries a `thinking` field with its concatenated reasoning blocks (absent
@@ -308,7 +308,10 @@ See `config.example.toml`. Notable knobs:
   first session-scoped event arrives, so a model that is still spawning or
   loading doesn't trip the watchdog. `wait_window_s` (default 20) is
   how long the async tools block before returning a pollable `running` handle —
-  keep it under the calling host's per-tool timeout. `job_result_ttl_s`
+  keep it under the calling host's per-tool timeout. Hard-capped at **25s**:
+  larger values raise `ConfigError` at startup because they risk the MCP
+  host's per-tool timeout (the per-call `max_wait_s` override was removed for
+  the same reason). `job_result_ttl_s`
   (default 600) is how long finished job results are retained for re-polling.
 - `[tools.<tool_name>]` — per-tool overrides for `agent` and `system_prompt`.
 

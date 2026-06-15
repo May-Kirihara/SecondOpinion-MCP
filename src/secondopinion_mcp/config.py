@@ -55,7 +55,9 @@ class ServerOpts:
     # block waiting for a reply before returning a `status:"running"` handle the
     # caller can poll. Kept well under a typical MCP host tool-timeout (~60s) so
     # the call returns before the host kills it. The external model keeps running
-    # server-side; poll_task resumes the wait. See server.py.
+    # server-side; poll_task resumes the wait. Hard-capped at 25s in load_config
+    # — larger values risk hitting the MCP host's tool-call timeout, which is
+    # the exact failure mode this design avoids. See server.py.
     wait_window_s: float = 20.0
     # How long finished-job payloads are retained so poll_task can re-deliver them.
     job_result_ttl_s: float = 600.0
@@ -139,6 +141,19 @@ def load_config(path: Path | None = None) -> Config:
             stall_first_event_grace_s=float(s.get("stall_first_event_grace_s", 120.0)),
             wait_window_s=float(s.get("wait_window_s", 20.0)),
             job_result_ttl_s=float(s.get("job_result_ttl_s", 600.0)),
+        )
+
+    # Hard-cap the inline wait window. Larger values risk hitting the MCP
+    # host's per-tool-call timeout (~60s), which surfaces as -32001 and defeats
+    # the deferred-session design. The per-call `max_wait_s` override was
+    # removed for the same reason — there is no longer a way to bypass this.
+    WAIT_WINDOW_MAX_S = 25.0
+    if cfg.server.wait_window_s > WAIT_WINDOW_MAX_S:
+        raise ConfigError(
+            f"server.wait_window_s={cfg.server.wait_window_s} exceeds the "
+            f"{WAIT_WINDOW_MAX_S:.0f}s hard cap. Larger values risk the MCP "
+            f"host's tool-call timeout (-32001). The per-call max_wait_s "
+            f"override was removed for the same reason."
         )
 
     providers_raw = raw.get("providers") or {}
