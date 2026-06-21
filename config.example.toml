@@ -30,13 +30,29 @@ hostname = "127.0.0.1"
 startup_timeout_s = 30
 request_timeout_s = 600   # generous — second opinions can take a while
 
+# Watchdog around POST /session (create_session). If the session creation does
+# not complete within this many seconds the client cancels its await and raises
+# CreateSessionTimeout (a subclass of httpx.TimeoutException), which surfaces as
+# a `session creation failed` error instead of silently blocking up to
+# request_timeout_s. Must be > 0 (ConfigError otherwise); values exceeding
+# request_timeout_s trigger a one-time WARNING at startup since the watchdog
+# would never fire before the absolute request timeout anyway.
+#
+# Residual risk: on timeout the client cancels its await but the opencode
+# server may still create the session in the background (orphan session).
+# The client cannot clean it up because it never received the session_id.
+# Detection and cleanup guidance: see README "Orphan sessions".
+create_session_timeout_s = 30
+
 # SSE-liveness watchdog. While a request is in flight the client subscribes to
 # opencode's `/event` stream; if no event scoped to that session arrives for
 # this many seconds, the request is failed fast as a transport stall instead of
 # blocking the full `request_timeout_s` in silence. `request_timeout_s` stays as
 # the backstop for slow-but-alive turns (they keep emitting events). Healthy
 # turns show a first event in ~1s and gaps under ~5s, so 30 leaves a wide
-# margin. Set to 0 to disable the watchdog (legacy behaviour).
+# margin. Set to 0 to disable BOTH the watchdog AND the SSE-attach fallback
+# (legacy behaviour) — when SSE cannot attach with idle=0 the POST falls back to
+# httpx's wall-clock timeout instead of being cancelled after `idle` seconds.
 stall_idle_timeout_s = 30
 
 # Cold-start grace for the watchdog. Until the FIRST session-scoped event

@@ -33,6 +33,20 @@ class TransportStall(httpx.TransportError):
     """
 
 
+class CreateSessionTimeout(httpx.TimeoutException):
+    """POST /session (create_session) exceeded `create_session_timeout_s`.
+
+    Subclasses `httpx.TimeoutException` so server.py's existing
+    `(TransportStall, httpx.TransportError, httpx.TimeoutException)` handler
+    picks it up and surfaces it as a ``session creation failed`` error payload
+    instead of silently blocking up to ``request_timeout_s``.
+
+    On timeout the client cancels its await, but the opencode server may still
+    create the session in the background (orphan session). See README for the
+    operational cleanup guidance.
+    """
+
+
 def _find_session_id(obj: object) -> str | None:
     """Recursively locate a session-id-ish string in an SSE event payload.
 
@@ -269,7 +283,13 @@ class OpencodeClient:
             body["model"]["variant"] = provider.variant
         if title:
             body["title"] = title
-        r = await self.http.post("/session", json=body)
+        timeout = self.config.server.create_session_timeout_s
+        try:
+            r = await asyncio.wait_for(self.http.post("/session", json=body), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise CreateSessionTimeout(
+                f"create_session exceeded {timeout}s"
+            ) from exc
         r.raise_for_status()
         data = r.json()
         return data["id"]
@@ -362,10 +382,16 @@ class OpencodeClient:
         session_beat: Callable[[], None] | None = None,
     ) -> None:
         """Consume the `/event` SSE stream and call `beat()` on every event
-        that proves *this* request is still progressing. Best-effort: if the
-        stream cannot be established the monitor just exits (`attached` stays
-        clear) and the caller falls back to the plain POST timeout —
-        availability is never sacrificed for the watchdog.
+        that proves *this* request is still progressing.
+
+        If the stream cannot be established (non-200, connect error, stream
+        timeout) the monitor just exits and ``attached`` stays clear. In that
+        case the caller applies an SSE-attach fallback: the POST is cancelled
+        after at most ``stall_idle_timeout_s`` plus loop granularity and SSE
+        connect latency (~10s upper bound) — so availability is never
+        sacrificed for the watchdog, but a dead connection no longer blocks
+        the full ``request_timeout_s`` in silence. The cancelled POST is
+        drained before raising ``TransportStall``.
         """
         try:
             async with self.http.stream(
@@ -406,11 +432,18 @@ class OpencodeClient:
         case — we never lower the wall-clock (that would false-kill healthy
         long turns, which keep emitting session events and so never trip the
         idle clock).
+
+        If the SSE stream fails to attach (non-200, connect error) the POST
+        is cancelled after an additional ``idle`` seconds (the SSE-attach
+        fallback) and ``TransportStall`` is raised. ``idle == 0`` disables
+        both the watchdog and the fallback (legacy bypass).
         """
         last = [time.monotonic()]
         session_event_seen = [False]
         attached = asyncio.Event()
         stop = asyncio.Event()
+        # Grace-progress logging state: 0 = none, 1 = 50% logged, 2 = 80% logged.
+        grace_logged = [0]
 
         def beat() -> None:
             last[0] = time.monotonic()
@@ -431,10 +464,44 @@ class OpencodeClient:
                 done, _ = await asyncio.wait({post}, timeout=min(idle, 5.0))
                 if post in done:
                     return post.result()
-                # SSE never attached → watchdog disabled, fall back to the
-                # POST's own httpx wall-clock timeout (legacy safety).
+                # SSE never attached → apply the SSE-attach fallback (path 2).
+                # If idle == 0 the watchdog AND the fallback are disabled
+                # (legacy bypass): block on the POST's own httpx wall-clock.
                 if sse.done() and not attached.is_set():
-                    return await post
+                    if idle > 0:
+                        try:
+                            return await asyncio.wait_for(post, timeout=idle)
+                        except asyncio.TimeoutError:
+                            post.cancel()
+                            with suppress(asyncio.CancelledError, Exception):
+                                await post
+                            raise TransportStall(
+                                f"SSE attach failed and POST exceeded {idle:.0f}s fallback; "
+                                f"connection stalled (session {session_id})"
+                            )
+                    else:
+                        # Legacy bypass: idle=0 disables both watchdog and SSE attach fallback.
+                        return await post
+                # Grace-progress logging (path 3): SSE is attached but no
+                # session-scoped event has arrived yet (cold start). Emit
+                # one-shot INFO at 50% and 80% of the grace window so a slow
+                # cold start is visible long before the watchdog fires.
+                if attached.is_set() and not session_event_seen[0] and grace > 0:
+                    elapsed_since_attach = time.monotonic() - last[0]
+                    if grace_logged[0] < 1 and elapsed_since_attach >= grace * 0.5:
+                        log.info(
+                            "session %s cold start: no session-scoped event after %.1fs "
+                            "(50%% of %.0fs grace threshold), still waiting",
+                            session_id, elapsed_since_attach, grace,
+                        )
+                        grace_logged[0] = 1
+                    if grace_logged[0] < 2 and elapsed_since_attach >= grace * 0.8:
+                        log.info(
+                            "session %s cold start: no session-scoped event after %.1fs "
+                            "(80%% of %.0fs grace threshold), approaching watchdog",
+                            session_id, elapsed_since_attach, grace,
+                        )
+                        grace_logged[0] = 2
                 if attached.is_set() and time.monotonic() - last[0] > threshold:
                     post.cancel()
                     with suppress(asyncio.CancelledError, Exception):

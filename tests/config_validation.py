@@ -12,6 +12,7 @@ Run from the repo root:
 
 from __future__ import annotations
 
+import logging
 import sys
 import tempfile
 from pathlib import Path
@@ -19,6 +20,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+from secondopinion_mcp import config as _config_module
 from secondopinion_mcp.config import ConfigError, load_config
 from secondopinion_mcp.server import _resolve_wait
 
@@ -152,10 +154,113 @@ def test_resolve_wait_bounds() -> None:
           w == 1.0, f"got {w}")
 
 
+def test_create_session_timeout_defaults_and_validation() -> None:
+    """T25-T29: create_session_timeout_s parsing, validation, and edge cases."""
+    print("[T25-T29: create_session_timeout_s validation]")
+
+    # Reset the module-level dedup flag so T28's WARNING is not swallowed by a
+    # prior test's side effect.
+    _config_module._WARNED_CREATE_SESSION_TOO_LONG = False
+
+    # T25: default is 30s when [server] is absent.
+    path = _write_config("")
+    try:
+        cfg = load_config(Path(path))
+        check("T25: default create_session_timeout_s is 30",
+              cfg.server.create_session_timeout_s == 30.0,
+              f"got {cfg.server.create_session_timeout_s}")
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+    # T25b: default also 30 when [server] exists but key is absent.
+    path = _write_config("port = 0")
+    try:
+        cfg = load_config(Path(path))
+        check("T25: default 30 even when [server] exists without the key",
+              cfg.server.create_session_timeout_s == 30.0)
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+    # T26: 0 is rejected.
+    path = _write_config("create_session_timeout_s = 0")
+    try:
+        load_config(Path(path))
+        check("T26: create_session_timeout_s=0 rejected", False, "no ConfigError")
+    except ConfigError as e:
+        check("T26: create_session_timeout_s=0 rejected",
+              "must be > 0" in str(e), f"ConfigError: {e}")
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+    # T27: negative is rejected.
+    path = _write_config("create_session_timeout_s = -1")
+    try:
+        load_config(Path(path))
+        check("T27: create_session_timeout_s=-1 rejected", False, "no ConfigError")
+    except ConfigError as e:
+        check("T27: create_session_timeout_s=-1 rejected",
+              "must be > 0" in str(e), f"ConfigError: {e}")
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+    # T28: > request_timeout_s warns once but succeeds.
+    _config_module._WARNED_CREATE_SESSION_TOO_LONG = False
+    records: list[logging.LogRecord] = []
+    log_handler = logging.Handler()
+    log_handler.emit = records.append  # type: ignore[method-assign]
+    cfg_logger = logging.getLogger("secondopinion_mcp.config")
+    original_level = cfg_logger.level
+    cfg_logger.setLevel(logging.DEBUG)
+    cfg_logger.addHandler(log_handler)
+    path = _write_config(
+        "create_session_timeout_s = 700\nrequest_timeout_s = 600"
+    )
+    try:
+        cfg = load_config(Path(path))
+        check("T28: load succeeds despite > request_timeout_s",
+              cfg.server.create_session_timeout_s == 700.0)
+        warnings = [r for r in records if r.levelno == logging.WARNING
+                    and "create_session_timeout_s" in r.getMessage()]
+        check("T28: exactly 1 WARNING logged",
+              len(warnings) == 1, f"got {len(warnings)}")
+        # A second load_config should NOT re-warn (dedup).
+        records.clear()
+        path2 = _write_config(
+            "create_session_timeout_s = 900\nrequest_timeout_s = 600"
+        )
+        load_config(Path(path2))
+        warnings2 = [r for r in records if r.levelno == logging.WARNING
+                     and "create_session_timeout_s" in r.getMessage()]
+        check("T28: no second WARNING after dedup flag is set",
+              len(warnings2) == 0, f"got {len(warnings2)}")
+        Path(path2).unlink(missing_ok=True)
+    finally:
+        cfg_logger.removeHandler(log_handler)
+        cfg_logger.setLevel(original_level)
+        _config_module._WARNED_CREATE_SESSION_TOO_LONG = False
+        Path(path).unlink(missing_ok=True)
+
+    # T29: malformed value propagates the standard exception (not ConfigError).
+    path = _write_config('create_session_timeout_s = "thirty"')
+    try:
+        load_config(Path(path))
+        check("T29: malformed value raises a standard exception", False, "no exception")
+    except ConfigError:
+        check("T29: malformed value raises a standard exception", False,
+              "got ConfigError (should propagate raw ValueError/TypeError)")
+    except (ValueError, TypeError) as e:
+        check("T29: malformed value raises ValueError or TypeError (not wrapped)",
+              isinstance(e, (ValueError, TypeError)), f"{type(e).__name__}: {e}")
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+
 def main() -> int:
     test_wait_window_cap()
     print()
     test_resolve_wait_bounds()
+    print()
+    test_create_session_timeout_defaults_and_validation()
 
     print()
     n_pass = sum(1 for _, ok, _ in _results if ok)

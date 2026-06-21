@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -25,6 +27,11 @@ from secondopinion_mcp.opencode_client import (
     TransportStall,
     _event_is_live,
     _find_session_id,
+)
+from secondopinion_mcp.server import (
+    AppState,
+    Job,
+    _wait_or_handle,
 )
 
 SID = "ses_test123"
@@ -162,24 +169,49 @@ async def test_stall_raises() -> None:
 
 
 async def test_sse_unavailable_falls_back() -> None:
-    print("[SSE unavailable — graceful fallback]")
+    """B-1: SSE attach failure + POST exceeding idle → TransportStall.
+
+    Previously this was a graceful-fallback test (POST completed within the
+    remaining idle window). With the SSE-attach fallback change, a POST that
+    exceeds ``idle`` seconds after SSE failure now raises ``TransportStall``
+    instead of blocking up to ``request_timeout_s``.
+    """
+    print("[B-1: SSE attach failure + POST > idle → TransportStall]")
 
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/event":
             return httpx.Response(503)  # watchdog cannot attach
-        await asyncio.sleep(1.0)  # POST is slow but completes
+        await asyncio.sleep(3.0)  # POST is slow — far exceeds idle=0.6s
         return httpx.Response(200, json={"ok": True})
 
     client = _make_client(handler, idle=0.6)
+    loop = asyncio.get_event_loop()
+    t0 = loop.time()
+    raised = False
     try:
-        r = await client._post_with_stall_watchdog(
+        await client._post_with_stall_watchdog(
             f"/session/{SID}/message", {"x": 1}, SID, 0.6
         )
-        check("falls back to plain POST when SSE cannot attach", r.status_code == 200)
-    except TransportStall as e:
-        check("falls back to plain POST when SSE cannot attach", False, f"raised {e!r}")
-    finally:
-        await client._http.aclose()
+    except TransportStall:
+        raised = True
+    elapsed = loop.time() - t0
+    await client._http.aclose()
+    check("SSE failure + slow POST raises TransportStall", raised)
+    check(
+        "TransportStall surfaces well under request_timeout_s",
+        elapsed < idle_upper_bound(0.6),
+        f"detected in {elapsed:.2f}s",
+    )
+
+
+def idle_upper_bound(idle: float) -> float:
+    """Loose upper bound for the SSE-attach fallback elapsed time.
+
+    The actual bound is ``idle + SSE connect latency (~10s) + loop tick``.
+    We use ``idle + 20.0`` as a comfortable test margin so wall-clock jitter
+    does not cause flaky failures.
+    """
+    return idle + 20.0
 
 
 async def test_cold_start_grace() -> None:
@@ -268,6 +300,195 @@ async def test_legacy_bypass() -> None:
         await client._http.aclose()
 
 
+# --------------------------------------------------------------------------
+# T22: SSE attach non-200 + hanging POST, session_ready -> recovering payload
+# --------------------------------------------------------------------------
+async def test_t22_sse_attach_fail_recovering() -> None:
+    print("[T22: SSE non-200 + hanging POST -> recovering with session_id]")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/event":
+            return httpx.Response(503)
+        if request.url.path == f"/session/{SID}/message" and request.method == "POST":
+            await asyncio.sleep(3.0)  # far exceeds idle=0.6s
+            return httpx.Response(200, json={"ok": True})
+        if request.url.path == "/session" and request.method == "POST":
+            return httpx.Response(200, json={"id": SID})
+        return httpx.Response(404)
+
+    state = _make_state_for_watchdog(handler, idle=0.6)
+    prov = Provider(name="t", provider_id="p", model_id="m")
+
+    async def _run():
+        state.jobs[job_id].session_id = SID
+        state.jobs[job_id].session_ready = True
+        return await state.client.send_message(
+            session_id=SID, provider=prov, agent="build", text="hi"
+        )
+
+    job_id = "job_t22"
+    job = Job(
+        task=asyncio.ensure_future(_run()),
+        kind="delegate_task",
+        provider=prov,
+        session_id=SID,
+        started=time.monotonic(),
+        expose_session=True,
+        session_ready=True,
+    )
+    state.jobs[job_id] = job
+
+    loop = asyncio.get_event_loop()
+    t0 = loop.time()
+    payload = await _wait_or_handle(state, job_id, job, 5.0)
+    elapsed = loop.time() - t0
+    await state.client._http.aclose()
+
+    check("status is recovering", payload.get("status") == "recovering")
+    check("session_id in payload", payload.get("session_id") == SID)
+    check(
+        "TransportStall surfaces under the loose upper bound",
+        elapsed < idle_upper_bound(0.6),
+        f"elapsed {elapsed:.2f}s",
+    )
+
+
+# --------------------------------------------------------------------------
+# T23: SSE attach delayed failure (stream timeout then 503) — same as T22
+# --------------------------------------------------------------------------
+async def test_t23_sse_attach_delayed_fail() -> None:
+    print("[T23: SSE delayed attach failure -> same TransportStall behaviour]")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/event":
+            await asyncio.sleep(0.3)  # simulate connect hang before 503
+            return httpx.Response(503)
+        if request.url.path == f"/session/{SID}/message" and request.method == "POST":
+            await asyncio.sleep(3.0)
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404)
+
+    client = _make_client(handler, idle=0.6)
+    loop = asyncio.get_event_loop()
+    t0 = loop.time()
+    raised = False
+    try:
+        await client._post_with_stall_watchdog(
+            f"/session/{SID}/message", {"x": 1}, SID, 0.6
+        )
+    except TransportStall:
+        raised = True
+    elapsed = loop.time() - t0
+    await client._http.aclose()
+    check("delayed SSE failure also raises TransportStall", raised)
+    check(
+        "elapsed under loose upper bound",
+        elapsed < idle_upper_bound(0.6),
+        f"elapsed {elapsed:.2f}s",
+    )
+
+
+# --------------------------------------------------------------------------
+# T24: idle=0 legacy bypass — SSE attach fallback NOT applied
+# --------------------------------------------------------------------------
+async def test_t24_legacy_bypass_no_fallback() -> None:
+    print("[T24: idle=0 legacy bypass — no TransportStall with slow POST]")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/event":
+            return httpx.Response(503)
+        await asyncio.sleep(0.5)  # slow but completes
+        return httpx.Response(
+            200, json={"info": {"tokens": {}}, "parts": [{"type": "text", "text": "ok"}]}
+        )
+
+    client = _make_client(handler, idle=0.0)
+    prov = Provider(name="t", provider_id="p", model_id="m")
+    try:
+        result = await client.send_message(
+            session_id=SID, provider=prov, agent="build", text="hi"
+        )
+        check(
+            "T24: no TransportStall on legacy bypass, POST completes",
+            result.text == "ok",
+        )
+    except TransportStall as e:
+        check(
+            "T24: no TransportStall on legacy bypass, POST completes",
+            False,
+            f"raised {e!r}",
+        )
+    finally:
+        await client._http.aclose()
+
+
+# --------------------------------------------------------------------------
+# T30: grace 50% / 80% INFO logging
+# --------------------------------------------------------------------------
+async def test_t30_grace_progress_logging() -> None:
+    print("[T30: grace 50% and 80% -> one-shot INFO each]")
+
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign]
+    lg = logging.getLogger("secondopinion_mcp.opencode_client")
+    # INFO records are below the default WARNING level — capture them.
+    original_level = lg.level
+    lg.setLevel(logging.DEBUG)
+    lg.addHandler(handler)
+    try:
+        async def stall_handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/event":
+                # SSE attaches and sends only heartbeats (no session-scoped
+                # events) so session_event_seen stays False throughout.
+                return httpx.Response(
+                    200, content=_sse_loop(0.1, {"type": "server.heartbeat"})
+                )
+            await asyncio.sleep(3600)  # POST hangs — grace logging fires first
+            return httpx.Response(200, json={})
+
+        # idle=0.5, grace=2.0 → 50% at 1.0s, 80% at 1.6s, watchdog at 2.0s.
+        client = _make_client(stall_handler, idle=0.5, grace=2.0)
+        raised = False
+        try:
+            await client._post_with_stall_watchdog(
+                f"/session/{SID}/message", {"x": 1}, SID, 0.5
+            )
+        except TransportStall:
+            raised = True
+        await client._http.aclose()
+        check("watchdog eventually fires TransportStall", raised)
+
+        infos = [r for r in records if r.levelno == logging.INFO]
+        fifties = [r for r in infos if "50%" in r.getMessage()]
+        eighties = [r for r in infos if "80%" in r.getMessage()]
+        check("exactly 1 INFO at 50% grace", len(fifties) == 1, f"got {len(fifties)}")
+        check("exactly 1 INFO at 80% grace", len(eighties) == 1, f"got {len(eighties)}")
+        check(
+            "50% INFO mentions session_id",
+            bool(fifties) and SID in fifties[0].getMessage(),
+        )
+    finally:
+        lg.removeHandler(handler)
+        lg.setLevel(original_level)
+
+
+def _make_state_for_watchdog(handler, idle: float, grace: float | None = None) -> AppState:
+    """Build an AppState wired to a mock-transport client. Used by the
+    T22 integration test that drives _wait_or_handle end-to-end."""
+    cfg = Config(
+        server=ServerOpts(
+            stall_idle_timeout_s=idle,
+            stall_first_event_grace_s=idle if grace is None else grace,
+        )
+    )
+    client = OpencodeClient(cfg)
+    client._http = httpx.AsyncClient(
+        base_url="http://mock", transport=httpx.MockTransport(handler)
+    )
+    return AppState(config=cfg, client=client)
+
+
 async def main() -> int:
     test_pure_helpers()
     await test_healthy_returns()
@@ -275,6 +496,10 @@ async def main() -> int:
     await test_sse_unavailable_falls_back()
     await test_cold_start_grace()
     await test_legacy_bypass()
+    await test_t22_sse_attach_fail_recovering()
+    await test_t23_sse_attach_delayed_fail()
+    await test_t24_legacy_bypass_no_fallback()
+    await test_t30_grace_progress_logging()
 
     failed = [n for n, ok, _ in _results if not ok]
     print(f"\n{len(_results) - len(failed)}/{len(_results)} checks passed")

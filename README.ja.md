@@ -36,7 +36,22 @@ MCP サーバーは起動時にローカルのランダムポートで `opencode
 
 HTTP リクエストが ReadTimeout や transport stall で死んでも、opencode は裏で作業を完了していることがよくあります。サーバーはこれをエラーとして握りつぶす代わりに、ジョブを `{"status": "recovering"}`（元のエラーは `transport_error` に格納）へ遷移させ、以後の `poll_task` のたびに opencode セッションが idle になったかを確認して、完了済みのアシスタント応答をセッションから回収します。呼び出し側は `recovering` を `running` と同じように扱い、poll を続けてください。リカバリを諦めてエラーを返すのは、ジョブ開始から `server.request_timeout_s` を超えたときだけです。
 
+stall watchdog は2つの沈黙ギャップをカバーします:
+
+1. **メッセージ送信中の stall** — 送信中のメッセージ POST が `stall_idle_timeout_s` 秒間、セッションスコープの `/event` を一切出さなかった場合、POST をキャンセルして transport stall として扱い、`request_timeout_s` までの沈黙ブロックを回避します。
+2. **SSE 接続失敗時のフォールバック** — `/event` SSE ストリーム自体の接続に失敗した場合（non-200、接続エラー、stream timeout）、POST は `stall_idle_timeout_s + ~15秒`（ループ粒度 + SSE 接続レイテンシ）でキャンセルされます。接続不良による `request_timeout_s` までの沈黙ブロックがなくなります。`stall_idle_timeout_s = 0` を設定すると、watchdog と SSE-attach fallback の**両方**を無効化します（legacy bypass）。
+
 完了したジョブの結果（成功・エラーとも）は `server.job_result_ttl_s`（既定 600 秒、直近 100 件まで）保持されます。poll の途中で呼び出し側自身がタイムアウトして応答を取り逃しても、同じ `job_id` を再 poll すれば `unknown job_id` ではなく同じ結果が再配達されます。
+
+### orphan session（取り残しセッション）
+
+`create_session` は watchdog（`server.create_session_timeout_s`、既定 30秒）で囲まれています。POST がこの時間内に完了しない場合、クライアントは await をキャンセルし `CreateSessionTimeout` を返します — `request_timeout_s` まで沈黙し続ける代わりに。`0` 以下の値は `ConfigError` になります（沈黙ギャップの再導入は許可しません）。`request_timeout_s` を超える値は起動時に一度だけ WARNING を出力します。
+
+**残留リスク（受諾済み）:** `asyncio.wait_for` がキャンセルするのは*クライアント側*の await のみです。opencode サーバー側では POST 処理が継続し、session が作成される可能性があります — これが **orphan session** です。クライアントは `session_id` を受け取っていないため、`delete_session` でクリーンアップできません。このトレードオフは、600秒の沈黙よりも session リークの方がマシという判断で受諾されています。
+
+- **検出:** `GET /session/status`（opencode の HTTP API、サーバーポート）でアクティブな session 一覧を取得できます。MCP server が idle でも session が残っていれば orphan の可能性が高い。
+- **クリーンアップ:** opencode serve は MCP server（親プロセス）と一緒に終了する設計です。**MCP server を再起動すれば orphan session も消えます。** これがサポートされる cleanup 手法です。
+- **サーバー側キャンセルは保証されません** — `asyncio.wait_for` はクライアントコルーチンのみをキャンセルし、サーバー側の処理中 HTTP リクエストはキャンセルしません。
 
 ## インストール
 
@@ -249,9 +264,14 @@ end_session(session_id=r["session_id"])
 - `default_agent` — opencode のエージェント名 (`build`, `plan`, または独自に定義したもの)。
 - `extra_serve_args` — `opencode serve` に渡す追加 CLI 引数。
 - `[server]` — port (`0` でランダム)、hostname、各種タイムアウト。
+  `create_session_timeout_s` (既定 30) は POST /session を watchdog で囲む:
+  セッション作成がこの秒数内に完了しないとクライアントはキャンセルして
+  `CreateSessionTimeout` を返す（沈黙ブロックの回避）。`0` 以下は `ConfigError`、
+  `request_timeout_s` を超える値は起動時に一度だけ WARNING。orphan session リスクは
+  上記「orphan session」参照。
   `stall_idle_timeout_s` は SSE 生存 watchdog の閾値: opencode の動きが
   この秒数途絶えたリクエストを、`request_timeout_s` を丸ごと待たずに
-  transport stall として即座に失敗させる (`0` で無効)。
+  transport stall として即座に失敗させる。**`0` で watchdog と SSE-attach fallback の両方を無効化** (legacy bypass)。
   `stall_first_event_grace_s` (既定 120) はコールドスタート猶予:
   最初のセッションスコープイベントが届くまではこちらを閾値に使い、
   モデルの起動・ロード中に watchdog が誤発しないようにする。`wait_window_s`

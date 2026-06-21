@@ -12,10 +12,14 @@ table containing `provider_id` and `model_id`.
 
 from __future__ import annotations
 
+import logging
 import os
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+
+
+log = logging.getLogger(__name__)
 
 
 class ConfigError(RuntimeError):
@@ -43,10 +47,19 @@ class ServerOpts:
     hostname: str = "127.0.0.1"
     startup_timeout_s: float = 30.0
     request_timeout_s: float = 600.0
+    # Watchdog around POST /session (create_session). If the session creation
+    # does not complete within this many seconds it is cancelled and surfaced
+    # as CreateSessionTimeout (a subclass of httpx.TimeoutException), instead
+    # of silently blocking up to request_timeout_s. Must be > 0; set higher
+    # than request_timeout_s at your own risk (a WARNING is logged once).
+    # Note: on timeout the client cancels its await but the opencode server
+    # may still create the session — see README "orphan session" guidance.
+    create_session_timeout_s: float = 30.0
     # SSE-liveness watchdog: if an in-flight message POST sees no session-scoped
     # `/event` for this many seconds it is failed fast as a transport stall,
     # instead of blocking the full `request_timeout_s` in silence. 0 disables
-    # the watchdog (legacy behaviour). See OpencodeClient._post_with_stall_watchdog.
+    # the watchdog AND the SSE attach fallback (legacy behaviour). See
+    # OpencodeClient._post_with_stall_watchdog.
     stall_idle_timeout_s: float = 30.0
     # Cold-start grace — idle threshold used until the first session-scoped SSE
     # event is seen, so model spawn/load doesn't trip the watchdog.
@@ -110,7 +123,14 @@ def find_config_path() -> Path | None:
     return None
 
 
+# Module-level dedup flag so the "create_session_timeout_s > request_timeout_s"
+# warning fires at most once per process lifetime — load_config can be called
+# repeatedly (tests, reloads) and the operator only needs to see it once.
+_WARNED_CREATE_SESSION_TOO_LONG: bool = False
+
+
 def load_config(path: Path | None = None) -> Config:
+    global _WARNED_CREATE_SESSION_TOO_LONG
     if path is None:
         path = find_config_path()
     if path is None:
@@ -137,11 +157,36 @@ def load_config(path: Path | None = None) -> Config:
             hostname=str(s.get("hostname", "127.0.0.1")),
             startup_timeout_s=float(s.get("startup_timeout_s", 30.0)),
             request_timeout_s=float(s.get("request_timeout_s", 600.0)),
+            create_session_timeout_s=float(s.get("create_session_timeout_s", 30.0)),
             stall_idle_timeout_s=float(s.get("stall_idle_timeout_s", 30.0)),
             stall_first_event_grace_s=float(s.get("stall_first_event_grace_s", 120.0)),
             wait_window_s=float(s.get("wait_window_s", 20.0)),
             job_result_ttl_s=float(s.get("job_result_ttl_s", 600.0)),
         )
+
+    # create_session_timeout_s must be strictly positive — 0 or negative would
+    # re-open the silence gap this setting exists to close.
+    if cfg.server.create_session_timeout_s <= 0:
+        raise ConfigError(
+            f"server.create_session_timeout_s={cfg.server.create_session_timeout_s} "
+            f"must be > 0. Use a larger request_timeout_s if you need more headroom; "
+            f"do not disable this watchdog."
+        )
+
+    # Warn (once) if create_session_timeout_s exceeds request_timeout_s — it is
+    # not a hard error (the operator may know what they are doing) but it likely
+    # indicates a misconfiguration since request_timeout_s is the absolute
+    # backstop for the whole call.
+    if cfg.server.create_session_timeout_s > cfg.server.request_timeout_s:
+        if not _WARNED_CREATE_SESSION_TOO_LONG:
+            log.warning(
+                "server.create_session_timeout_s=%s exceeds request_timeout_s=%s — "
+                "the session-creation watchdog will never fire before the absolute "
+                "request timeout. This is likely a misconfiguration.",
+                cfg.server.create_session_timeout_s,
+                cfg.server.request_timeout_s,
+            )
+            _WARNED_CREATE_SESSION_TOO_LONG = True
 
     # Hard-cap the inline wait window. Larger values risk hitting the MCP
     # host's per-tool-call timeout (~60s), which surfaces as -32001 and defeats
