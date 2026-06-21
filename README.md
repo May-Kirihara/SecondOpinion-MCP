@@ -64,11 +64,48 @@ idle and recovers the finished assistant reply from it. Callers should treat
 `recovering` exactly like `running`: keep polling. Recovery gives up — and
 reports an error — only after `server.request_timeout_s` from job start.
 
+The stall watchdog covers two silence gaps:
+
+1. **In-flight message stalls** — if an in-flight message POST produces no
+   session-scoped `/event` for `stall_idle_timeout_s` seconds, the POST is
+   cancelled and surfaced as a transport stall instead of blocking the full
+   `request_timeout_s` in silence.
+2. **SSE-attach fallback** — if the `/event` SSE stream itself fails to attach
+   (non-200, connect error, stream timeout), the POST is cancelled after at
+   most `stall_idle_timeout_s + ~15s` (loop granularity plus SSE connect
+   latency). A dead connection no longer silently blocks up to
+   `request_timeout_s`. Set `stall_idle_timeout_s = 0` to disable **both** the
+   watchdog and the SSE-attach fallback (legacy bypass).
+
 Finished results (success or error) are also retained for
 `server.job_result_ttl_s` (default 600s, capped at the 100 most recent), so a
 caller that missed a reply — e.g. its own tool call timed out mid-poll — can
 re-poll the same `job_id` and get the result re-delivered instead of
 `unknown job_id`.
+
+### Orphan sessions
+
+`create_session` is wrapped in a watchdog (`server.create_session_timeout_s`,
+default 30s). If the POST does not complete within that window the client
+cancels its await and surfaces `CreateSessionTimeout` — instead of silently
+blocking up to `request_timeout_s`. `0` or negative values raise `ConfigError`
+(re-enabling the silence gap is not allowed); values exceeding
+`request_timeout_s` trigger a one-time WARNING at startup.
+
+**Residual risk (accepted):** `asyncio.wait_for` cancels the *client-side*
+await only. The opencode server may still complete the POST and create the
+session — an **orphan session**. The client never received the `session_id`, so
+it cannot call `delete_session` to clean up. This trade-off is accepted because
+600s of silence is worse than a session leak.
+
+- **Detection:** `GET /session/status` (opencode's HTTP API on the server's
+  port) returns the active session map; if sessions remain after the MCP server
+  is idle, they are likely orphans.
+- **Cleanup:** `opencode serve` is designed to terminate together with the MCP
+  server (its parent process). **Restarting the MCP server clears orphan
+  sessions.** This is the supported cleanup path.
+- **Server-side cancellation is NOT guaranteed** — `asyncio.wait_for` only
+  cancels the client coroutine, not the in-flight HTTP request on the server.
 
 ## Install
 
@@ -300,10 +337,16 @@ See `config.example.toml`. Notable knobs:
 
 - `default_agent` — opencode agent name (`build`, `plan`, or your own).
 - `extra_serve_args` — extra CLI args passed to `opencode serve`.
-- `[server]` — port (0 = random), hostname, timeouts. `stall_idle_timeout_s`
+- `[server]` — port (0 = random), hostname, timeouts. `create_session_timeout_s`
+  (default 30) wraps POST /session in a watchdog — if session creation does not
+  complete within that many seconds the client cancels and surfaces
+  `CreateSessionTimeout` instead of silently blocking. `0` or negative raises
+  `ConfigError`; values exceeding `request_timeout_s` trigger a one-time WARNING
+  at startup. See "Orphan sessions" above for the residual risk. `stall_idle_timeout_s`
   controls the SSE-liveness watchdog: a request with no opencode activity for
   that many seconds is failed fast as a transport stall instead of blocking the
-  full `request_timeout_s` (set 0 to disable). `stall_first_event_grace_s`
+  full `request_timeout_s`. Set to **0 to disable BOTH the watchdog AND the
+  SSE-attach fallback** (legacy bypass). `stall_first_event_grace_s`
   (default 120) is the cold-start grace: the idle threshold used until the
   first session-scoped event arrives, so a model that is still spawning or
   loading doesn't trip the watchdog. `wait_window_s` (default 20) is

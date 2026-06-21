@@ -39,6 +39,11 @@ class Job:
     session_ready: bool = False
     recovering: bool = False
     recovery_busy: bool = False
+    # Consecutive None returns from fetch_session_result during the recovering
+    # loop. >= 5 emits a one-shot WARNING (see _track_recovery_streak). Resets
+    # to 0 (along with recovery_warned) the moment a non-None result arrives.
+    recovery_busy_streak: int = 0
+    recovery_warned: bool = False
     last_error: str | None = None
 
 
@@ -182,6 +187,31 @@ def _recovering_payload(job_id: str, job: Job) -> dict[str, Any]:
     if job.expose_session and job.session_id:
         payload["session_id"] = job.session_id
     return payload
+
+
+def _track_recovery_streak(job_id: str, job: Job, fetched: MessageResult | None) -> None:
+    """Update ``recovery_busy_streak`` after each ``fetch_session_result`` call
+    in the recovering loop. At 5 consecutive Nones a one-shot WARNING is
+    emitted so a long-busy recovery is visible without spamming the log.
+    A non-None result resets both the streak and the warned flag so a
+    subsequent stall earns a fresh WARNING.
+
+    Extracted from ``poll_task`` so the streak/warn semantics are unit-testable
+    without driving the full MCP tool-call path.
+    """
+    if fetched is not None:
+        job.recovery_busy_streak = 0
+        job.recovery_warned = False
+        return
+    job.recovery_busy_streak += 1
+    if job.recovery_busy_streak >= 5 and not job.recovery_warned:
+        elapsed = round(time.monotonic() - job.started, 1)
+        log.warning(
+            "job %s (%s) session %s still reports busy for %ds — may be legitimately "
+            "slow, will keep polling until request_timeout_s",
+            job_id, job.kind, job.session_id, elapsed,
+        )
+        job.recovery_warned = True
 
 
 async def _wait_or_handle(
@@ -557,6 +587,7 @@ def build_server() -> FastMCP:
                 job.recovery_busy = True
                 try:
                     result = await state.client.fetch_session_result(job.session_id)
+                    _track_recovery_streak(job_id, job, result)
                     if result is not None and result.text:
                         payload = _done_payload(job, result)
                         payload["note"] = "recovered from the session after a transport error"

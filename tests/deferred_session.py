@@ -9,6 +9,7 @@ Run from the repo root:
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 import time
 from contextlib import suppress
@@ -20,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from secondopinion_mcp.config import Config, Provider, ServerOpts
 from secondopinion_mcp.opencode_client import (
+    CreateSessionTimeout,
     MessageResult,
     OpencodeClient,
     TransportStall,
@@ -30,6 +32,7 @@ from secondopinion_mcp.server import (
     Job,
     _recovering_payload,
     _running_payload,
+    _track_recovery_streak,
     _wait_or_handle,
 )
 
@@ -42,8 +45,8 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     print(f"  {'PASS' if ok else 'FAIL'}  {name}{'  — ' + detail if detail else ''}")
 
 
-def _make_client(handler) -> OpencodeClient:
-    cfg = Config(server=ServerOpts())
+def _make_client(handler, server_opts: ServerOpts | None = None) -> OpencodeClient:
+    cfg = Config(server=server_opts or ServerOpts())
     client = OpencodeClient(cfg)
     client._http = httpx.AsyncClient(
         base_url="http://mock", transport=httpx.MockTransport(handler)
@@ -51,9 +54,9 @@ def _make_client(handler) -> OpencodeClient:
     return client
 
 
-def _make_state(handler) -> AppState:
-    client = _make_client(handler)
-    return AppState(config=Config(), client=client)
+def _make_state(handler, server_opts: ServerOpts | None = None) -> AppState:
+    client = _make_client(handler, server_opts)
+    return AppState(config=client.config, client=client)
 
 
 # ---------------------------------------------------------------------------
@@ -436,8 +439,172 @@ def test_recovering_payload_no_session_id() -> None:
 
 
 # ---------------------------------------------------------------------------
-# main
+# T20: create_session exceeds create_session_timeout_s -> CreateSessionTimeout
 # ---------------------------------------------------------------------------
+async def test_create_session_timeout() -> None:
+    print("[T20: create_session exceeds timeout -> CreateSessionTimeout]")
+    opts = ServerOpts(create_session_timeout_s=0.3)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session" and request.method == "POST":
+            await asyncio.sleep(2.0)  # far exceeds 0.3s timeout
+            return httpx.Response(200, json={"id": SID})
+        return httpx.Response(404)
+
+    client = _make_client(handler, opts)
+    prov = Provider(name="t", provider_id="p", model_id="m")
+    raised: Exception | None = None
+    try:
+        await client.create_session(provider=prov, agent="build", title="test")
+    except CreateSessionTimeout as e:
+        raised = e
+    except Exception as e:
+        raised = e
+    finally:
+        await client._http.aclose()
+
+    check("CreateSessionTimeout raised", isinstance(raised, CreateSessionTimeout), repr(raised))
+    check(
+        "is subclass of httpx.TimeoutException",
+        isinstance(raised, httpx.TimeoutException),
+    )
+    check(
+        "message includes timeout value",
+        raised is not None and "0.3" in str(raised),
+        repr(raised),
+    )
+
+
+# ---------------------------------------------------------------------------
+# T21: create_session timeout -> _wait_or_handle returns error payload
+# ---------------------------------------------------------------------------
+async def test_create_session_timeout_error_payload() -> None:
+    print("[T21: create_session timeout -> session creation failed error]")
+    opts = ServerOpts(create_session_timeout_s=0.3)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/session" and request.method == "POST":
+            await asyncio.sleep(2.0)
+            return httpx.Response(200, json={"id": SID})
+        return httpx.Response(404)
+
+    state = _make_state(handler, opts)
+    prov = Provider(name="t", provider_id="p", model_id="m")
+
+    async def _run() -> MessageResult:
+        sid = await state.client.create_session(
+            provider=prov, agent="build", title="test"
+        )
+        state.jobs[job_id].session_id = sid
+        state.jobs[job_id].session_ready = True
+        return await state.client.send_message(
+            session_id=sid, provider=prov, agent="build", text="hi"
+        )
+
+    job_id = "job_t21"
+    job = Job(
+        task=asyncio.ensure_future(_run()),
+        kind="delegate_task",
+        provider=prov,
+        session_id="",
+        started=time.monotonic(),
+        expose_session=True,
+        session_ready=False,
+    )
+    state.jobs[job_id] = job
+
+    payload = await _wait_or_handle(state, job_id, job, 5.0)
+    check("status is error", payload.get("status") == "error")
+    check(
+        "error contains 'session creation failed'",
+        "session creation failed" in payload.get("error", ""),
+    )
+    check(
+        "error contains CreateSessionTimeout",
+        "CreateSessionTimeout" in payload.get("error", ""),
+    )
+    check(
+        "error message is non-empty after the colon",
+        payload.get("error", "").rstrip().endswith(": ") is False,
+        repr(payload.get("error", "")),
+    )
+    check("job_id in state.finished", job_id in state.finished)
+    check("job_id NOT in state.jobs", job_id not in state.jobs)
+    await state.client._http.aclose()
+
+
+# ---------------------------------------------------------------------------
+# T31: recovering streak — 5 consecutive Nones -> one-shot WARNING
+# ---------------------------------------------------------------------------
+async def test_recovery_streak_warning() -> None:
+    print("[T31: recovering streak >= 5 -> one-shot WARNING]")
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign]
+    lg = logging.getLogger("secondopinion_mcp")
+    lg.addHandler(handler)
+    try:
+        prov = Provider(name="t", provider_id="p", model_id="m")
+        job_id = "job_t31"
+        job = Job(
+            task=asyncio.ensure_future(asyncio.sleep(0)),
+            kind="delegate_task",
+            provider=prov,
+            session_id="ses_t31",
+            started=time.monotonic(),
+            expose_session=True,
+            recovering=True,
+            session_ready=True,
+        )
+
+        # Feed 5 consecutive Nones — WARNING fires at streak 5.
+        for i in range(5):
+            _track_recovery_streak(job_id, job, None)
+        warnings_5 = [r for r in records if r.levelno == logging.WARNING]
+        check(
+            "exactly 1 WARNING after 5 consecutive Nones",
+            len(warnings_5) == 1,
+            f"got {len(warnings_5)}",
+        )
+        check(
+            "WARNING mentions session_id",
+            warnings_5 and "ses_t31" in warnings_5[0].getMessage(),
+        )
+        check(
+            "WARNING mentions 'legitimately slow'",
+            warnings_5 and "legitimately slow" in warnings_5[0].getMessage(),
+        )
+        check("recovery_warned is True", job.recovery_warned is True)
+
+        # 5 more Nones — no additional WARNING (still suppressed).
+        records.clear()
+        for i in range(5):
+            _track_recovery_streak(job_id, job, None)
+        warnings_10 = [r for r in records if r.levelno == logging.WARNING]
+        check(
+            "no additional WARNING while warned flag is set",
+            len(warnings_10) == 0,
+            f"got {len(warnings_10)}",
+        )
+
+        # A non-None result resets the streak and warned flag.
+        result = MessageResult(session_id="ses_t31", text="recovered")
+        _track_recovery_streak(job_id, job, result)
+        check("streak reset to 0 after non-None", job.recovery_busy_streak == 0)
+        check("recovery_warned reset to False", job.recovery_warned is False)
+
+        # 5 more Nones — a fresh WARNING is emitted.
+        records.clear()
+        for i in range(5):
+            _track_recovery_streak(job_id, job, None)
+        warnings_fresh = [r for r in records if r.levelno == logging.WARNING]
+        check(
+            "fresh WARNING after reset + 5 Nones",
+            len(warnings_fresh) == 1,
+            f"got {len(warnings_fresh)}",
+        )
+    finally:
+        lg.removeHandler(handler)
 async def main() -> int:
     await test_slow_create_returns_running()
     await test_existing_session_skips_create()
@@ -448,6 +615,9 @@ async def main() -> int:
     test_running_payload_session_pending()
     test_running_payload_with_session_id()
     test_recovering_payload_no_session_id()
+    await test_create_session_timeout()
+    await test_create_session_timeout_error_payload()
+    await test_recovery_streak_warning()
 
     failed = [n for n, ok, _ in _results if not ok]
     print(f"\n{len(_results) - len(failed)}/{len(_results)} checks passed")
